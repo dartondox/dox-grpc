@@ -155,8 +155,11 @@ dependencies:
 dev_dependencies:
   lints: any
 ''');
-    File('${Directory.current.path}/pubspec_overrides.yaml')
-        .copySync('${pkg.path}/pubspec_overrides.yaml');
+    // CI writes it on a PR (ci/use-siblings.sh); a release run has none
+    File overrides = File('${Directory.current.path}/pubspec_overrides.yaml');
+    if (overrides.existsSync()) {
+      overrides.copySync('${pkg.path}/pubspec_overrides.yaml');
+    }
     ProcessResult get = Process.runSync('dart', <String>[
       'pub',
       'get',

@@ -43,9 +43,10 @@ class GrpcInstallCommand extends Command {
     installer.addEnv('APP_HTTP2', 'true');
 
     installer.printSummary(<String>[
-      'Turn on HTTP/2 in lib/config/app.dart: set `http2: true`. Or add an '
-          '`appHttp2` getter to AppEnv, run `dart run build_runner build`, '
-          'and set `http2: env.appHttp2`. Then APP_HTTP2 in .env controls it.',
+      'Turn on HTTP/2 in lib/config/app.dart: set `http2: true`. Or let '
+          'APP_HTTP2 in .env control it: add `bool? get appHttp2;` to AppEnv, '
+          'run `dart run build_runner build`, and set '
+          '`http2: env.appHttp2 ?? false`.',
       'Run `dart run build_runner build`, so the app finds GrpcRouter (a '
           'router in lib/routes is picked up by itself). If your app lists '
           'its routers by hand, add `GrpcRouter()` to that list.',
