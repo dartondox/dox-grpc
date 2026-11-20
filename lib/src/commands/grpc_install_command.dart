@@ -51,8 +51,8 @@ class GrpcInstallCommand extends Command {
           'its routers by hand, add `GrpcRouter()` to that list.',
       'Install protoc (for example `brew install protobuf`) and its Dart '
           'plugin: `dart pub global activate protoc_plugin`.',
-      'Make the Dart code: `mkdir -p lib/app/grpc && protoc '
-          '--dart_out=grpc:lib/app/grpc -Iprotos protos/greeter.proto`.',
+      'Make the Dart code: `mkdir -p lib/generated && protoc '
+          '--dart_out=grpc:lib/generated -Iprotos protos/greeter.proto`.',
       'Write a service class that extends `GreeterServiceBase`, and register '
           'it in lib/routes/grpc.dart.',
       'Read the gRPC docs: https://dartondox.dev/digging-deeper/grpc/',
@@ -61,7 +61,7 @@ class GrpcInstallCommand extends Command {
 
   /// `protos/greeter.proto`, a small sample service
   static const String greeterProto = '''
-// Make the Dart code: protoc --dart_out=grpc:lib/app/grpc -Iprotos protos/greeter.proto
+// Make the Dart code: protoc --dart_out=grpc:lib/generated -Iprotos protos/greeter.proto
 syntax = "proto3";
 
 package greeter;

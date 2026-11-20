@@ -60,7 +60,7 @@ void main() {
       'pub add protobuf',
     ]);
     String proto = read('protos/greeter.proto');
-    expect(proto, contains('protoc --dart_out=grpc:lib/app/grpc'));
+    expect(proto, contains('protoc --dart_out=grpc:lib/generated'));
     expect(proto, contains('syntax = "proto3";'));
     expect(proto, contains('package greeter;'));
     expect(proto, contains('service Greeter'));
