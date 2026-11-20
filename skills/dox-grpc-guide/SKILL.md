@@ -98,6 +98,7 @@ class GrpcRouter extends Router {
 Rules:
 - A prefix or `Route.group` around `Grpc.register` throws a `StateError` at start.
 - The first `Grpc.register` must not be inside `Route.middleware(...)`. Later ones may be.
+- The health router must come first in `AppConfig.routers`.
 - An unknown service or method gets `UNIMPLEMENTED`.
 - gRPC routes skip `RequestTimeout`, so long streams are not cut.
 

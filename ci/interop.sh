@@ -15,6 +15,12 @@
 #   GRPCURL         go install github.com/fullstorydev/grpcurl/cmd/grpcurl@v1.9.4
 # ISOLATES (default 1) sets the isolates of the server.
 #
+# The .proto files in test/interop/protos and protos/ come from the grpc
+# release v1.85.3 (src/proto/grpc/testing/*.proto and the health proto). To
+# update: copy the new files from that release, then make the Dart code with
+#   protoc --dart_out=grpc:test/interop/generated -Itest/interop/protos \
+#     test/interop/protos/src/proto/grpc/testing/*.proto
+#
 # It fails when one case fails. It stops the server and the containers it
 # started.
 set -euo pipefail
@@ -28,8 +34,8 @@ proxy_port=8080
 isolates=${ISOLATES:-1}
 client=${INTEROP_CLIENT:-client}
 grpcurl=${GRPCURL:-grpcurl}
-nginx_image=nginx:1.29.3-alpine
-caddy_image=caddy:2.10.2-alpine
+nginx_image=nginx:1.29.3-alpine@sha256:b3c656d55d7ad751196f21b7fd2e8d4da9cb430e32f646adcf92441b72f82b14
+caddy_image=caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
 
 # grpc-go's interop client has no gzip cases. Gzip is tested in
 # test/e2e_test.dart with package:grpc.
@@ -67,6 +73,7 @@ wait_ready() {
   done
   echo "$1 is not ready"
   cat "$work/server.log"
+  [ -n "$container" ] && docker logs "$container" | tail -50
   exit 1
 }
 
@@ -100,16 +107,17 @@ grpcurl)
   test_proto=(-plaintext -max-time 10 -import-path test/interop/protos
     -proto src/proto/grpc/testing/test.proto)
   set -x
-  "$grpcurl" "${test_proto[@]}" -d '{"response_size": 3}' \
-    127.0.0.1:$port grpc.testing.TestService/UnaryCall |
-    grep -q '"body": "AAAA"'
-  [ "$("$grpcurl" "${test_proto[@]}" \
+  out=$("$grpcurl" "${test_proto[@]}" -d '{"response_size": 3}' \
+    127.0.0.1:$port grpc.testing.TestService/UnaryCall)
+  grep -q '"body": "AAAA"' <<<"$out"
+  out=$("$grpcurl" "${test_proto[@]}" \
     -d '{"response_parameters": [{"size": 1}, {"size": 2}, {"size": 3}]}' \
-    127.0.0.1:$port grpc.testing.TestService/StreamingOutputCall |
-    grep -c '"body"')" = 3 ]
-  health -d '{"service": "grpc.testing.TestService"}' 127.0.0.1:$port |
-    grep -q SERVING
-  health 127.0.0.1:$port | grep -q SERVING
+    127.0.0.1:$port grpc.testing.TestService/StreamingOutputCall)
+  [ "$(grep -c '"body"' <<<"$out")" = 3 ]
+  out=$(health -d '{"service": "grpc.testing.TestService"}' 127.0.0.1:$port)
+  grep -q '"status": "SERVING"' <<<"$out"
+  out=$(health 127.0.0.1:$port)
+  grep -q '"status": "SERVING"' <<<"$out"
   # an unknown service: grpcurl exits with the status
   if "$grpcurl" "${test_proto[@]}" 127.0.0.1:$port \
     grpc.testing.UnimplementedService/UnimplementedCall 2>"$work/err"; then
@@ -121,10 +129,19 @@ grpcurl)
   "$grpcurl" "${test_proto[@]}" 127.0.0.1:$port \
     grpc.testing.XdsUpdateHealthService/SetNotServing
   sleep 0.5
+  # The server sends its isolate id in the x-dox-isolate header. All checks
+  # must see NOT_SERVING, and at least 2 isolates must have answered.
+  ids=
   for _ in $(seq 1 20); do
-    health -d '{"service": "grpc.testing.TestService"}' 127.0.0.1:$port |
-      grep -q NOT_SERVING
+    out=$(health -v -d '{"service": "grpc.testing.TestService"}' \
+      127.0.0.1:$port 2>&1)
+    grep -q '"status": "NOT_SERVING"' <<<"$out"
+    ids+=$(sed -n 's/^x-dox-isolate: *//p' <<<"$out" | tr -d '\r')$'\n'
   done
+  [ "$(sort -u <<<"$ids" | grep -c .)" -ge 2 ] || {
+    echo "fewer than 2 isolates answered: $ids"
+    exit 1
+  }
   set +x
   echo "grpcurl: all checks passed"
   ;;

@@ -5,6 +5,7 @@
 //   dart run test/interop/server.dart --port 10000 --isolates 2
 
 import 'dart:async';
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:dox_core/dox_core.dart';
@@ -86,8 +87,13 @@ class TestService extends TestServiceBase {
     Stream<StreamingOutputCallRequest> request,
   ) async* {
     List<StreamingOutputCallRequest> all = await request.toList();
+    _echoMetadata(call);
     for (StreamingOutputCallRequest message in all) {
-      yield* streamingOutputCall(call, message);
+      for (ResponseParameters params in message.responseParameters) {
+        await _sleep(params.intervalUs);
+        yield StreamingOutputCallResponse(payload: _payload(params.size));
+      }
+      _throwStatus(message.responseStatus);
     }
   }
 
@@ -143,10 +149,25 @@ class XdsUpdateHealthService extends XdsUpdateHealthServiceBase {
   }
 }
 
+/// The id of this isolate. A top-level final is one value per isolate.
+final String isolateId = Random().nextInt(1 << 30).toString();
+
+/// A health service that tells which isolate answered. Test only.
+class InteropHealthService extends HealthService {
+  @override
+  Future<HealthCheckResponse> check(
+    ServiceCall call,
+    HealthCheckRequest request,
+  ) {
+    call.headers!['x-dox-isolate'] = isolateId;
+    return super.check(call, request);
+  }
+}
+
 class InteropRouter extends Router {
   @override
   void register() {
-    HealthService health = HealthService();
+    HealthService health = InteropHealthService();
     Grpc.register(health);
     Grpc.register(TestService());
     Grpc.register(XdsUpdateHealthService(health));

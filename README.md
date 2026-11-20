@@ -70,7 +70,7 @@ class GrpcRouter extends Router {
 }
 ```
 
-The middleware of the router runs before each call. Keep the health service out of a router with auth middleware, or a load balancer's health check gets `UNAUTHENTICATED`. `Route.middleware([...], () => Grpc.register(...))` works too, but not for the first `Grpc.register` (see below). The gRPC routes skip `RequestTimeout`, so a long stream is not cut.
+The middleware of the router runs before each call. Keep the health service out of a router with auth middleware (and put the health router first in `AppConfig.routers`), or a load balancer's health check gets `UNAUTHENTICATED`. `Route.middleware([...], () => Grpc.register(...))` works too, but not for the first `Grpc.register` (see below). The gRPC routes skip `RequestTimeout`, so a long stream is not cut.
 
 A call to a service that is not registered gets `UNIMPLEMENTED`, and so does a method the service does not have.
 
@@ -115,6 +115,7 @@ A middleware that throws a Dox HTTP error goes to the client as a gRPC error, wi
 
 - `call.clientMetadata` has the request headers, except the `grpc-*` ones.
 - Set `call.headers` before the first message, and `call.trailers` before the end.
+- A `-bin` value stays base64 text, as in `package:grpc`. `GrpcWire.decodeBinary` gives its bytes (with or without padding), and `GrpcWire.encodeBinary` makes one.
 - The three maps are nullable in `ServiceCall`, so use `!`. In Dox they are always there until the call sends them.
 
 ```dart
@@ -122,7 +123,6 @@ String? requestId = call.clientMetadata!['x-request-id'];
 call.headers!['x-request-id'] = requestId ?? 'none';
 call.trailers!['x-done'] = 'yes';
 ```
-- A `-bin` value stays base64 text, as in `package:grpc`. `GrpcWire.decodeBinary` gives its bytes (with or without padding), and `GrpcWire.encodeBinary` makes one.
 
 ## Deadlines and cancel
 

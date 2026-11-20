@@ -7,3 +7,6 @@ build/
 
 # the interop server and its protos (CI only)
 test/interop/
+
+# CI scripts
+ci/
