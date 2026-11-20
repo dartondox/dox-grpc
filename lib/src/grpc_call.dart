@@ -26,10 +26,19 @@ class GrpcCall implements ServiceCall {
     required this._errors,
     required this._request,
     required this._debug,
+    this._holdLimit = defaultHoldLimit,
   }) : _reader = GrpcMessageReader(_options.maxReceiveMessageSize);
+
+  /// How long a status waits for a handler that does not end, after the
+  /// deadline or the idle timeout fired. It is the same as `ZOMBIE_WAIT` in
+  /// `dox_http_native`: after this time the native server stops counting
+  /// the call. Without it, a client that stays connected would wait for
+  /// ever for a handler that hangs.
+  static const Duration defaultHoldLimit = Duration(seconds: 30);
 
   final NativeGrpcStream _stream;
   final Service _service;
+  final Duration _holdLimit;
 
   /// null when the service has no such method
   final ServiceMethod<dynamic, dynamic>? _method;
@@ -65,6 +74,12 @@ class GrpcCall implements ServiceCall {
 
   /// the status that waits to go out, see [_finish]
   Map<String, String>? _status;
+
+  /// ends the wait for the handler when it takes too long, see [_holdLimit]
+  Timer? _holdTimer;
+
+  /// true once [_finish] ran. It runs only once.
+  bool _finishRan = false;
 
   /// completes when a single answer that is still on its way ends, see
   /// [_stopAll]
@@ -530,6 +545,9 @@ class GrpcCall implements ServiceCall {
 
   /// Sends [_status] (when set) and ends the answer.
   void _finish(Object? _) {
+    if (_finishRan) return;
+    _finishRan = true;
+    _holdTimer?.cancel();
     Map<String, String>? trailers = _status;
     _status = null;
     try {
@@ -563,10 +581,14 @@ class GrpcCall implements ServiceCall {
     Future<void>? running = _stopAll();
     if (running == null) {
       _finish(null);
-    } else {
-      running.then(_finish);
+      return;
     }
+    // a status does not wait for ever for a handler that hangs
+    if (_status != null) _holdTimer = Timer(_holdLimit, _finishNow);
+    running.then(_finish, onError: _finish);
   }
+
+  void _finishNow() => _finish(null);
 
   /// The client left or reset the stream: stop, send no status.
   void _cancel() {
@@ -620,7 +642,12 @@ class GrpcCall implements ServiceCall {
   /// An error of the handler after the call ended. The client has its
   /// status already, so the error is only reported.
   void _reportLate(Object error, StackTrace stackTrace) {
-    _toException(error, stackTrace);
+    try {
+      _toException(error, stackTrace);
+    } catch (_) {
+      // the error handler itself failed: nobody is left to tell, and the
+      // call must still end
+    }
   }
 
   /// the single answer failed after the call ended (it is cancelled on

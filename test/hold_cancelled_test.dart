@@ -96,26 +96,36 @@ class SlowEcho extends EchoServiceBase {
   /// completes when a handler started
   Completer<void> started = Completer<void>();
 
-  /// lets the unary handler finish
+  /// lets the handler go on
   Completer<void> release = Completer<void>();
+
+  /// the handler throws when it goes on
+  bool fail = false;
+
+  Future<void> _wait() async {
+    started.complete();
+    await release.future;
+    if (fail) throw StateError('boom');
+    events.add('handler done');
+  }
 
   @override
   Future<EchoReply> unary(ServiceCall call, EchoRequest request) async {
-    started.complete();
-    await release.future;
-    events.add('handler done');
+    await _wait();
     return EchoReply(text: request.text);
   }
 
   @override
-  Stream<EchoReply> serverStream(ServiceCall call, EchoRequest request) async* {
+  Stream<EchoReply> serverStream(ServiceCall call, EchoRequest request) =>
+      _stream();
+
+  Stream<EchoReply> _stream() async* {
     try {
       yield EchoReply(text: 'first');
-      started.complete();
-      await Future<void>.delayed(const Duration(milliseconds: 100));
+      await _wait();
       yield EchoReply(text: 'never sent');
     } finally {
-      events.add('handler done');
+      events.add('stream exit');
     }
   }
 
@@ -123,23 +133,48 @@ class SlowEcho extends EchoServiceBase {
   Future<EchoReply> clientStream(
     ServiceCall call,
     Stream<EchoRequest> request,
-  ) => throw UnimplementedError();
+  ) async {
+    await _wait();
+    return EchoReply(text: 'done');
+  }
 
   @override
   Stream<EchoReply> bidi(ServiceCall call, Stream<EchoRequest> request) =>
-      throw UnimplementedError();
+      _stream();
+}
+
+/// Records the reports. [fail] makes the report itself throw.
+class RecordingHandler extends ExceptionHandler {
+  RecordingHandler({this.fail = false});
+
+  final bool fail;
+  final List<Object> reported = <Object>[];
+
+  @override
+  void reportFor(HttpRequest req, Object error, StackTrace stackTrace) {
+    reported.add(error);
+    if (fail) throw StateError('the report failed');
+  }
 }
 
 /// Starts [method] with one request message. The body is closed.
-Future<void> start(SlowEcho service, FakeStream stream, String method) {
+Future<void> start(
+  SlowEcho service,
+  FakeStream stream,
+  String method, {
+  GrpcOptions options = const GrpcOptions(),
+  Duration holdLimit = GrpcCall.defaultHoldLimit,
+  ExceptionHandler? errors,
+}) {
   GrpcCall call = GrpcCall(
     stream,
     service,
     service.$lookupMethod(method),
-    const GrpcOptions(),
-    errors: ExceptionHandler(),
+    options,
+    errors: errors ?? ExceptionHandler(),
     request: FakeRequest(),
     debug: true,
+    holdLimit: holdLimit,
   );
   Future<void> finished = call.run();
   stream.input
@@ -147,6 +182,8 @@ Future<void> start(SlowEcho service, FakeStream stream, String method) {
     ..close();
   return finished;
 }
+
+int ends() => events.where((String e) => e == 'end').length;
 
 /// lets timers and microtasks run
 Future<void> settle([int ms = 20]) {
@@ -180,12 +217,86 @@ void main() {
 
     stream.goneSignal.complete();
     await settle();
-    // the generator waits on its delay; the answer is still open
+    // the generator waits; the answer is still open
     expect(events, <String>['message']);
 
+    service.release.complete();
     await finished;
-    expect(events, <String>['message', 'handler done', 'end']);
+    expect(events, <String>['message', 'handler done', 'stream exit', 'end']);
   });
+
+  test('a cancelled client streaming call ends after its handler', () async {
+    SlowEcho service = SlowEcho();
+    FakeStream stream = FakeStream();
+    Future<void> finished = start(service, stream, 'ClientStream');
+    await service.started.future;
+
+    stream.goneSignal.complete();
+    await settle();
+    expect(events, isEmpty, reason: 'the handler still runs');
+
+    service.release.complete();
+    await finished;
+    expect(events, <String>['handler done', 'end']);
+  });
+
+  test('a cancelled bidi call ends after its handler', () async {
+    SlowEcho service = SlowEcho();
+    FakeStream stream = FakeStream();
+    Future<void> finished = start(service, stream, 'Bidi');
+    await service.started.future;
+
+    stream.goneSignal.complete();
+    await settle();
+    expect(events, <String>['message']);
+
+    service.release.complete();
+    await finished;
+    expect(events, <String>['message', 'handler done', 'stream exit', 'end']);
+  });
+
+  for (String method in <String>['Unary', 'ServerStream']) {
+    test(
+      '$method: a handler that throws after cancel ends the call once',
+      () async {
+        SlowEcho service = SlowEcho()..fail = true;
+        FakeStream stream = FakeStream();
+        RecordingHandler errors = RecordingHandler();
+        Future<void> finished = start(service, stream, method, errors: errors);
+        await service.started.future;
+
+        stream.goneSignal.complete();
+        await settle();
+        service.release.complete();
+        await finished;
+        await settle();
+
+        expect(ends(), 1);
+        expect(errors.reported, hasLength(1));
+        expect(errors.reported.single, isA<StateError>());
+      },
+    );
+
+    test(
+      '$method: an error handler that throws does not stop the end',
+      () async {
+        SlowEcho service = SlowEcho()..fail = true;
+        FakeStream stream = FakeStream();
+        RecordingHandler errors = RecordingHandler(fail: true);
+        Future<void> finished = start(service, stream, method, errors: errors);
+        await service.started.future;
+
+        stream.goneSignal.complete();
+        await settle();
+        service.release.complete();
+        await finished.timeout(const Duration(seconds: 5));
+        await settle();
+
+        expect(ends(), 1);
+        expect(errors.reported, hasLength(1));
+      },
+    );
+  }
 
   test('a call past its deadline sends the status after its handler', () async {
     SlowEcho service = SlowEcho();
@@ -202,10 +313,74 @@ void main() {
     expect(stream.sent['grpc-status'], '4');
   });
 
+  test(
+    'a call past its idle timeout sends the status after its handler',
+    () async {
+      SlowEcho service = SlowEcho();
+      FakeStream stream = FakeStream();
+      Future<void> finished = start(
+        service,
+        stream,
+        'Unary',
+        options: const GrpcOptions(idleTimeout: Duration(milliseconds: 20)),
+      );
+      await service.started.future;
+
+      await settle(60);
+      expect(events, isEmpty, reason: 'the handler still runs');
+
+      service.release.complete();
+      await finished;
+      expect(events, <String>['handler done', 'end']);
+      expect(stream.sent['grpc-status'], '4');
+    },
+  );
+
+  test('a cancel after the deadline still sends the status once', () async {
+    SlowEcho service = SlowEcho();
+    FakeStream stream = FakeStream(<String, String>{'grpc-timeout': '20m'});
+    Future<void> finished = start(service, stream, 'Unary');
+    await service.started.future;
+
+    await settle(60);
+    stream.goneSignal.complete();
+    await settle();
+    expect(events, isEmpty, reason: 'the handler still runs');
+
+    service.release.complete();
+    await finished;
+    await settle();
+    expect(events, <String>['handler done', 'end']);
+    expect(stream.sent['grpc-status'], '4');
+  });
+
+  test('a handler that never ends does not hold the status for ever', () async {
+    SlowEcho service = SlowEcho();
+    FakeStream stream = FakeStream(<String, String>{'grpc-timeout': '20m'});
+    Future<void> finished = start(
+      service,
+      stream,
+      'Unary',
+      holdLimit: const Duration(milliseconds: 50),
+    );
+    await service.started.future;
+
+    // the handler is never released
+    await finished.timeout(const Duration(seconds: 5));
+    expect(events, <String>['end']);
+    expect(stream.sent['grpc-status'], '4');
+
+    // the handler ends later: the call does not end a second time
+    service.release.complete();
+    await settle();
+    expect(ends(), 1);
+  });
+
   test('a call that ends normally is unchanged', () async {
     SlowEcho service = SlowEcho();
     FakeStream stream = FakeStream();
     Future<void> finished = start(service, stream, 'Unary');
+    await service.started.future;
     service.release.complete();
     await finished;
     expect(events, <String>['handler done', 'message', 'end']);
