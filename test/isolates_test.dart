@@ -15,7 +15,7 @@ String randomKey() {
 
 void main() {
   test(
-    'two isolates: the services are copied, health changes reach both',
+    'two isolates: the health service is copied and answers there',
     () async {
       HealthService health = HealthService();
       Grpc.register(health);
@@ -34,9 +34,11 @@ void main() {
       health.setStatus('svc', ServingStatus.NOT_SERVING);
       await Future<void>.delayed(const Duration(milliseconds: 100));
 
-      // new connections, so both isolates answer some of them. Linux spreads
+      // New connections, so both isolates answer some of them. Linux spreads
       // them over the isolates. macOS gives them all to one, so there this
-      // test only shows that the services copy to the second isolate.
+      // only shows that the app works with two isolates. The sync logic
+      // itself (late joiners, newest change wins) is tested with a fake bus
+      // in health_sync_test.dart.
       Set<ServingStatus> seen = <ServingStatus>{};
       for (int i = 0; i < 20; i++) {
         ClientChannel channel = ClientChannel(

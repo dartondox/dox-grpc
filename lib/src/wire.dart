@@ -31,12 +31,24 @@ class GrpcMessageReader {
   Uint8List? _body;
   int _bodyLength = 0;
 
+  /// the length of the message being read, from its head
+  int _expected = 0;
+
+  /// The first buffer of a message. It grows by doubling up to the declared
+  /// length, so a client that only declares a big length does not make us
+  /// allocate it. 64 KiB covers most messages in one step.
+  static const int _firstBuffer = 64 * 1024;
+
   /// true when a message started but did not end yet
   bool get hasPartial => _headLength > 0;
 
+  /// the bytes held now for the message being read (for tests)
+  int get bufferedCapacity => _body?.length ?? 0;
+
   /// Adds the next [part] of the body and gives the messages that are now
   /// whole. Throws [GrpcException] for a message over [maxMessageSize],
-  /// before its bytes are kept.
+  /// before its bytes are kept, and for a compressed flag that is not 0
+  /// or 1.
   List<GrpcFrame> add(Uint8List part) {
     List<GrpcFrame> frames = <GrpcFrame>[];
     int i = 0;
@@ -47,6 +59,12 @@ class GrpcMessageReader {
         _headLength += take;
         i += take;
         if (_headLength < 5) break;
+        if (_head[0] > 1) {
+          throw GrpcException(
+            GrpcStatus.internal,
+            'Invalid compressed flag ${_head[0]}',
+          );
+        }
         int length = ByteData.sublistView(_head).getUint32(1);
         if (length > maxMessageSize) {
           throw GrpcException(
@@ -54,15 +72,21 @@ class GrpcMessageReader {
             'Received message larger than max ($length vs. $maxMessageSize)',
           );
         }
-        _body = Uint8List(length);
+        _expected = length;
+        _body = Uint8List(_min(length, _firstBuffer));
         _bodyLength = 0;
       }
+      int take = _min(_expected - _bodyLength, part.length - i);
       Uint8List body = _body!;
-      int take = _min(body.length - _bodyLength, part.length - i);
+      if (_bodyLength + take > body.length) {
+        int size = _min(_expected, _max(body.length * 2, _bodyLength + take));
+        body = Uint8List(size)..setRange(0, _bodyLength, body);
+        _body = body;
+      }
       body.setRange(_bodyLength, _bodyLength + take, part, i);
       _bodyLength += take;
       i += take;
-      if (_bodyLength == body.length) {
+      if (_bodyLength == _expected) {
         frames.add(GrpcFrame(_head[0] == 1, body));
         _headLength = 0;
         _body = null;
@@ -72,6 +96,8 @@ class GrpcMessageReader {
   }
 
   static int _min(int a, int b) => a < b ? a : b;
+
+  static int _max(int a, int b) => a > b ? a : b;
 }
 
 /// Small pieces of the gRPC wire format.

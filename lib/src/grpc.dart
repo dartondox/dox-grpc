@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:dox_core/dox_core.dart';
+import 'package:dox_core/router/route_data.dart';
 import 'package:dox_grpc/src/grpc_call.dart';
 import 'package:dox_grpc/src/grpc_options.dart';
 import 'package:dox_grpc/src/grpc_status.dart';
@@ -25,9 +26,6 @@ import 'package:protobuf/protobuf.dart';
 class Grpc {
   Grpc._();
 
-  /// true once this isolate has the fallback for unknown services
-  static bool _fallbackAdded = false;
-
   /// Adds the route `POST /<package.Service>/{method}` for [service]. A
   /// method the service does not have gets `UNIMPLEMENTED`. So does a
   /// gRPC call to a service that is not registered.
@@ -35,20 +33,85 @@ class Grpc {
   /// The route skips `RequestTimeout`, so a long stream is not cut. Its
   /// errors (eg. a middleware that throws 401) go to the client as gRPC
   /// errors.
+  ///
+  /// Throws a [StateError] when a prefix or group changed the route path,
+  /// because no gRPC client could reach it then.
   static void register(
     Service service, {
     GrpcOptions options = const GrpcOptions(),
   }) {
     GrpcServiceRoute route = GrpcServiceRoute(service, options);
-    Route.post('/${service.$name}/{method}', route.handle)
+    String path = '/${service.$name}/{method}';
+    Route.post(path, route.handle)
         .withoutMiddleware<RequestTimeout>()
         .renderErrorsWith(GrpcServiceRoute.renderError);
-    if (_fallbackAdded) return;
-    _fallbackAdded = true;
+    _checkPath(Route().routes.last.path, path);
+    if (Route().fallbacks.any(_isOurFallback)) return;
     Route.fallback(
       GrpcServiceRoute.unknownService,
       when: GrpcServiceRoute.isGrpcRequest,
     ).renderErrorsWith(GrpcServiceRoute.renderError);
+    RouteData fallback = Route().fallbacks.last;
+    _checkPath(fallback.path, '/');
+    if (!_hasOnlyRouterMiddleware(fallback.preMiddleware)) {
+      throw StateError(
+        'dox_grpc: the first Grpc.register is inside Route.middleware. The '
+        'fallback for unknown services would run that middleware too. '
+        'Register the first service (eg. the HealthService) in a router '
+        'with no prefix, outside Route.middleware.',
+      );
+    }
+  }
+
+  static bool _isOurFallback(RouteData data) {
+    return data.fallbackWhen == GrpcServiceRoute.isGrpcRequest;
+  }
+
+  /// Throws when [actual] is not [expected], ignoring `//` and an end `/`.
+  static void _checkPath(String actual, String expected) {
+    if (_clean(actual) == _clean(expected)) return;
+    throw StateError(
+      'dox_grpc: the route is "$actual", but gRPC clients call '
+      '"$expected". Register gRPC services in a router with no prefix, '
+      'outside any Route.group or Route.prefix.',
+    );
+  }
+
+  static String _clean(String path) {
+    String clean = path.replaceAll(RegExp('/+'), '/');
+    if (clean.length > 1 && clean.endsWith('/')) {
+      clean = clean.substring(0, clean.length - 1);
+    }
+    return clean.isEmpty ? '/' : clean;
+  }
+
+  /// true when [middleware] is only what a router gets: the global
+  /// middleware, then the middleware of one router. Any more came from a
+  /// `Route.middleware` around the call.
+  static bool _hasOnlyRouterMiddleware(List<dynamic> middleware) {
+    if (middleware.isEmpty) return true;
+    List<dynamic> global = Dox().allGlobalMiddleware;
+    List<Router> routers = <Router>[
+      ...Dox().config.routers,
+      ...Dox().ioc.routers,
+    ];
+    if (_sameItems(middleware, global)) return true;
+    for (Router router in routers) {
+      if (_sameItems(middleware, <dynamic>[...global, ...router.middleware])) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /// Same kinds, in order. A router makes its middleware list again on each
+  /// call, so the objects themselves can not be compared.
+  static bool _sameItems(List<dynamic> a, List<dynamic> b) {
+    if (a.length != b.length) return false;
+    for (int i = 0; i < a.length; i++) {
+      if (a[i].runtimeType != b[i].runtimeType) return false;
+    }
+    return true;
   }
 }
 
@@ -126,8 +189,9 @@ class GrpcServiceRoute {
   }
 
   /// [error] as a gRPC status. An HTTP error gets the gRPC status of its
-  /// HTTP code, and keeps its message. Any other error is `INTERNAL`, with
-  /// its text only when [debug] is true.
+  /// HTTP code, and keeps its message, but a 5xx keeps it only when [debug]
+  /// is true. Any other error is `INTERNAL`, with its text only when
+  /// [debug] is true.
   static GrpcException toGrpcException(Object error, {required bool debug}) {
     if (error is GrpcException) return error;
     if (error is GrpcError) {
@@ -139,6 +203,10 @@ class GrpcServiceRoute {
     }
     if (error is IHttpException) {
       Object? message = error.message;
+      // the text of a 5xx may show inner details: only in debug
+      if (error.code >= 500 && !debug) {
+        return GrpcException(GrpcStatus.fromHttp(error.code), 'Internal error');
+      }
       return GrpcException(
         GrpcStatus.fromHttp(error.code),
         message is String ? message : null,

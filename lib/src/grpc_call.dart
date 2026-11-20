@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -49,6 +50,7 @@ class GrpcCall implements ServiceCall {
 
   DateTime? _deadline;
   Timer? _timer;
+  Timer? _idleTimer;
   bool _timedOut = false;
   bool _canceled = false;
 
@@ -58,6 +60,14 @@ class GrpcCall implements ServiceCall {
   /// true once the response headers are set on the response
   bool _headWritten = false;
   bool _received = false;
+
+  /// the one message of a call with a single request. It goes to the
+  /// handler only when the client is done, so a call with a bad second
+  /// message never runs the handler.
+  dynamic _single;
+
+  /// frames that wait their turn, see [_onPart]
+  final Queue<GrpcFrame> _queued = Queue<GrpcFrame>();
 
   /// the `grpc-encoding` of the request, lower case
   String? _requestEncoding;
@@ -79,14 +89,10 @@ class GrpcCall implements ServiceCall {
   @override
   DateTime? get deadline => _deadline;
 
-  /// true once the deadline passed. Also when the client cancelled at its
-  /// deadline before our timer ran.
+  /// true once the deadline passed (our timer ran, or the client cancelled
+  /// at its deadline before our timer did)
   @override
-  bool get isTimedOut {
-    DateTime? deadline = _deadline;
-    return _timedOut ||
-        (deadline != null && !DateTime.now().isBefore(deadline));
-  }
+  bool get isTimedOut => _timedOut;
 
   @override
   bool get isCanceled => _canceled;
@@ -111,12 +117,11 @@ class GrpcCall implements ServiceCall {
             .contains('gzip');
 
     ServiceMethod<dynamic, dynamic>? method = _method;
-    if (requestHeaders.value('te') != 'trailers') {
+    // a missing `te` is fine. When it is there, it must be `trailers`.
+    String? te = requestHeaders.value('te');
+    if (te != null && te.toLowerCase() != 'trailers') {
       _endWith(
-        GrpcException(
-          GrpcStatus.internal,
-          'The te: trailers header is missing',
-        ),
+        GrpcException(GrpcStatus.internal, 'The te header must be trailers'),
       );
       return _finished.future;
     }
@@ -130,15 +135,22 @@ class GrpcCall implements ServiceCall {
       return _finished.future;
     }
 
+    String? rawTimeout = requestHeaders.value('grpc-timeout');
+    Duration? timeout = GrpcWire.parseTimeout(rawTimeout);
+    if (rawTimeout != null && timeout == null) {
+      _endWith(
+        GrpcException(GrpcStatus.internal, 'Malformed grpc-timeout header'),
+      );
+      return _finished.future;
+    }
+
     _stream.gone.then(_onGone);
-    Duration? timeout = GrpcWire.parseTimeout(
-      requestHeaders.value('grpc-timeout'),
-    );
     if (timeout != null) {
       _deadline = DateTime.now().add(timeout);
       _timer = Timer(timeout, _onTimeout);
     }
 
+    _touch();
     StreamSubscription<Uint8List> incoming = _incoming = _stream.body.listen(
       _onPart,
       onError: _onBodyError,
@@ -194,16 +206,54 @@ class GrpcCall implements ServiceCall {
     _clientMetadata[name] = values.join(',');
   }
 
+  /// One part of the body. Messages that need unzip, when there are many
+  /// in this part, are done one per event loop turn (see [_drain]). So a
+  /// small zipped part with hundreds of messages can not hold the isolate.
+  /// The usual part (no zip, or one message) is done at once.
   void _onPart(Uint8List part) {
     if (_ended) return;
+    _touch();
+    List<GrpcFrame> frames;
     try {
-      for (GrpcFrame frame in _reader.add(part)) {
-        _onFrame(frame);
-        if (_ended) return;
-      }
+      frames = _reader.add(part);
     } on GrpcException catch (error) {
-      _endWith(error);
+      _failRequest(error);
+      return;
     }
+    if (frames.length > 1 && frames.any(_isCompressed)) {
+      _queued.addAll(frames);
+      _drain();
+      return;
+    }
+    for (GrpcFrame frame in frames) {
+      if (!_handleFrame(frame)) return;
+    }
+  }
+
+  static bool _isCompressed(GrpcFrame frame) => frame.compressed;
+
+  /// Handles the queued frames, and waits one event loop turn after each.
+  /// The body is paused meanwhile, so no part comes in between.
+  Future<void> _drain() async {
+    StreamSubscription<Uint8List> incoming = _incoming!;
+    incoming.pause();
+    while (_queued.isNotEmpty && !_ended) {
+      if (!_handleFrame(_queued.removeFirst())) break;
+      await Future<void>.delayed(Duration.zero);
+    }
+    _queued.clear();
+    if (!_ended) incoming.resume();
+  }
+
+  /// false when the call ended because of this frame
+  bool _handleFrame(GrpcFrame frame) {
+    try {
+      _onFrame(frame);
+    } on GrpcException catch (error) {
+      _failRequest(error);
+      return false;
+    }
+    return !_ended;
   }
 
   void _onFrame(GrpcFrame frame) {
@@ -238,20 +288,36 @@ class GrpcCall implements ServiceCall {
       );
     }
     _received = true;
-    _requests!.add(message);
+    if (method.streamingRequest) {
+      _requests!.add(message);
+    } else {
+      _single = message;
+    }
   }
 
   void _onBodyDone() {
     if (_ended) return;
     if (_reader.hasPartial) {
-      _endWith(
+      _failRequest(
         GrpcException(GrpcStatus.internal, 'The last message is not whole'),
       );
     } else if (!_received && !_method!.streamingRequest) {
-      _endWith(GrpcException(GrpcStatus.unimplemented, 'No request received'));
+      _failRequest(
+        GrpcException(GrpcStatus.unimplemented, 'No request received'),
+      );
     } else {
+      if (!_method!.streamingRequest) _requests!.add(_single);
       _requests!.close();
     }
+  }
+
+  /// The request side failed (a bad message, an early end). The handler
+  /// gets the error in its request stream, so it can not take a half
+  /// request as a whole one. Then the call ends with the same error.
+  void _failRequest(GrpcException error) {
+    StreamController<dynamic>? requests = _requests;
+    if (requests != null && !requests.isClosed) requests.addError(error);
+    _endWith(error);
   }
 
   /// the client reset the stream
@@ -264,8 +330,28 @@ class GrpcCall implements ServiceCall {
     if (_ended) return;
     _timedOut = true;
     _canceled = true;
-    _requests?.addError(GrpcError.deadlineExceeded('Deadline exceeded'));
-    _endWith(GrpcException(GrpcStatus.deadlineExceeded, 'Deadline exceeded'));
+    _failRequest(
+      GrpcException(GrpcStatus.deadlineExceeded, 'Deadline exceeded'),
+    );
+  }
+
+  /// Restarts the idle timer. Called on each message in or out.
+  void _touch() {
+    Duration? idle = _options.idleTimeout;
+    if (idle == null || _ended) return;
+    _idleTimer?.cancel();
+    _idleTimer = Timer(idle, _onIdle);
+  }
+
+  void _onIdle() {
+    if (_ended) return;
+    _canceled = true;
+    _failRequest(
+      GrpcException(
+        GrpcStatus.deadlineExceeded,
+        'No message for ${_options.idleTimeout!.inSeconds} s (idle timeout)',
+      ),
+    );
   }
 
   // ---- the answer ----
@@ -293,6 +379,7 @@ class GrpcCall implements ServiceCall {
     if (_gzipResponses) bytes = GrpcWire.gzipEncode(bytes);
     if (!_headWritten) _writeHead();
     _stream.add(GrpcWire.frame(bytes, compressed: _gzipResponses));
+    _touch();
     if (!method.streamingResponse) return;
     // send it now, and wait while the client is slow
     StreamSubscription<dynamic> responses = _responses!;
@@ -301,6 +388,7 @@ class GrpcCall implements ServiceCall {
   }
 
   void _resume(Object? _) {
+    _touch();
     StreamSubscription<dynamic>? responses = _responses;
     if (responses != null && responses.isPaused) responses.resume();
   }
@@ -340,6 +428,7 @@ class GrpcCall implements ServiceCall {
     if (_ended) return;
     _ended = true;
     _timer?.cancel();
+    _idleTimer?.cancel();
 
     Map<String, String> trailers = <String, String>{
       ...?_trailers,
@@ -370,8 +459,18 @@ class GrpcCall implements ServiceCall {
     if (_ended) return;
     _ended = true;
     _canceled = true;
+    DateTime? deadline = _deadline;
+    if (deadline != null && !DateTime.now().isBefore(deadline)) {
+      _timedOut = true;
+    }
     _timer?.cancel();
-    _requests?.addError(GrpcError.cancelled('Cancelled'));
+    _idleTimer?.cancel();
+    // the request stream is already closed when the client sent all its
+    // messages before it left
+    StreamController<dynamic>? requests = _requests;
+    if (requests != null && !requests.isClosed) {
+      requests.addError(GrpcError.cancelled('Cancelled'));
+    }
     _stream.end();
     _stopAll();
     _finished.complete();

@@ -66,6 +66,29 @@ The middleware of the router runs before each call. `Route.middleware([...], () 
 
 A call to a service that is not registered gets `UNIMPLEMENTED`, and so does a method the service does not have.
 
+If a prefix or a `Route.group` changes the route path, `Grpc.register` throws a `StateError` at start. No client could reach that route. The first service must also be registered outside `Route.middleware`, because the `UNIMPLEMENTED` answer for unknown services is added with it.
+
+## Services run in every isolate
+
+Dox runs your app in many isolates. A service is copied to each of them (a service made in a router is made again in each isolate). So a service must not hold a database connection, a socket or a `ReceivePort` in a field that is set when you register it. Those can not be copied. Create them lazily, inside the isolate, on first use:
+
+```dart
+class GreeterService extends GreeterServiceBase {
+  Database? _db;
+
+  // made on the first call, in the isolate that runs it
+  Database get db => _db ??= Database.connect();
+
+  @override
+  Future<HelloReply> sayHello(ServiceCall call, HelloRequest request) async {
+    User user = await db.findUser(request.name);
+    return HelloReply(message: 'Hello ${user.name}');
+  }
+}
+```
+
+Or get the connection from a Dox provider, which runs in each isolate.
+
 ## Errors
 
 Throw a `GrpcException` to end the call with a status:
@@ -99,12 +122,16 @@ Grpc.register(
     maxReceiveMessageSize: 4 * 1024 * 1024,
     maxSendMessageSize: 4 * 1024 * 1024,
     gzipResponses: false,
+    idleTimeout: Duration(minutes: 5),
   ),
 );
 ```
 
 - A message over the size limit ends the call with `RESOURCE_EXHAUSTED`. Both limits are 4 MiB by default, like other gRPC servers. The request limit also counts the bytes after unzip.
 - Requests in gzip are always read. Responses are zipped only with `gzipResponses: true`, and only for clients that accept gzip. It is off by default, because it costs CPU on each message.
+- `idleTimeout` is off by default. When it is set, a call with no message in or out for that long ends with `DEADLINE_EXCEEDED`. It frees the call of a client that never reads the answer, or a request that never ends (for example a unary call that never half-closes). The quiet time of your handler counts too, so set it longer than your slowest quiet handler. We suggest `Duration(minutes: 5)`. The deadline of the client (`grpc-timeout`) always works, with or without it.
+- When one part of the body holds many zipped messages, they are unzipped one per event loop turn, so one stream can not hold the isolate. The unzipped size of each message is limited by `maxReceiveMessageSize`.
+- A request error (a message that is too big, not valid, or cut short, or a second message in a unary call) reaches your method as an error in its request stream. A unary method is called only when its one message is complete.
 
 ## Health check
 
@@ -116,7 +143,7 @@ Grpc.register(health);
 health.setStatus('helloworld.Greeter', ServingStatus.SERVING);
 ```
 
-The empty name `''` is the whole server and starts as `SERVING`. A change in one isolate goes to the other isolates of the app too (on the Dox `IsolateBus`).
+The empty name `''` is the whole server and starts as `SERVING`. A change in one isolate goes to the other isolates of the app too (on the Dox `IsolateBus`). Each isolate joins when the server starts there, and its first `Check` or `Watch` waits a short time (up to 300 ms) for the other isolates to tell their status.
 
 ## Not yet
 

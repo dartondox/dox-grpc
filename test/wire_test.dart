@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
+import 'package:dox_core/dox_core.dart';
 import 'package:dox_grpc/dox_grpc.dart';
 import 'package:dox_grpc/src/grpc.dart';
 import 'package:dox_grpc/src/wire.dart';
@@ -50,6 +51,30 @@ void main() {
       expect(a.map((GrpcFrame f) => utf8.decode(f.data)), <String>['first']);
       List<GrpcFrame> b = reader.add(wire.sublist(13));
       expect(b.map((GrpcFrame f) => utf8.decode(f.data)), <String>['second']);
+    });
+
+    test('a declared length does not allocate that much at once', () {
+      GrpcMessageReader reader = GrpcMessageReader(4 * 1024 * 1024);
+      Uint8List head = Uint8List(5);
+      ByteData.sublistView(head).setUint32(1, 4 * 1024 * 1024);
+      expect(reader.add(head), isEmpty);
+      expect(reader.bufferedCapacity, lessThanOrEqualTo(64 * 1024));
+    });
+
+    test('a big message in parts keeps every byte', () {
+      GrpcMessageReader reader = GrpcMessageReader(4 * 1024 * 1024);
+      Uint8List message = Uint8List(1000 * 1000 + 7);
+      for (int i = 0; i < message.length; i++) {
+        message[i] = (i * 31) & 0xff;
+      }
+      Uint8List wire = GrpcWire.frame(message);
+      List<GrpcFrame> frames = <GrpcFrame>[];
+      for (int i = 0; i < wire.length; i += 70000) {
+        int end = i + 70000 < wire.length ? i + 70000 : wire.length;
+        frames.addAll(reader.add(wire.sublist(i, end)));
+      }
+      expect(frames, hasLength(1));
+      expect(frames.single.data, message);
     });
 
     test('a message over the limit throws before its body comes', () {
@@ -173,5 +198,49 @@ void main() {
     expect(GrpcServiceRoute.isGrpcType('application/grpc+json'), isFalse);
     expect(GrpcServiceRoute.isGrpcType('application/json'), isFalse);
     expect(GrpcServiceRoute.isGrpcType(null), isFalse);
+  });
+
+  group('an HTTP error from a middleware', () {
+    test('keeps its message for 4xx', () {
+      GrpcException e = GrpcServiceRoute.toGrpcException(
+        HttpStatusException(401, message: 'no token'),
+        debug: false,
+      );
+      expect(e.status, GrpcStatus.unauthenticated);
+      expect(e.message, 'no token');
+    });
+
+    test('hides the message for 5xx outside debug', () {
+      GrpcException e = GrpcServiceRoute.toGrpcException(
+        HttpStatusException(503, message: 'db password is x'),
+        debug: false,
+      );
+      expect(e.status, GrpcStatus.unavailable);
+      expect(e.message, 'Internal error');
+    });
+
+    test('shows the message for 5xx in debug', () {
+      GrpcException e = GrpcServiceRoute.toGrpcException(
+        HttpStatusException(503, message: 'db is down'),
+        debug: true,
+      );
+      expect(e.message, 'db is down');
+    });
+  });
+
+  test('an invalid compressed flag is INTERNAL', () {
+    GrpcMessageReader reader = GrpcMessageReader(1024);
+    Uint8List frame = GrpcWire.frame(bytes('x'));
+    frame[0] = 2;
+    expect(
+      () => reader.add(frame),
+      throwsA(
+        isA<GrpcException>().having(
+          (GrpcException e) => e.status,
+          'status',
+          GrpcStatus.internal,
+        ),
+      ),
+    );
   });
 }
