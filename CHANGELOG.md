@@ -1,5 +1,6 @@
 ## Unreleased (3.3.0)
 
+- Adds `dox grpc:install` (and `dox add grpc`). It adds the packages, a sample `protos/greeter.proto`, `lib/routes/grpc.dart` with the health service, and `APP_HTTP2` in `.env`, then prints the next steps. It never overwrites a file.
 - Faster server streaming: a handler is paused only before its first message and when the native window is full. Before, it was paused after every message, so each message cost its own socket write. Now messages made together go out in one write. This needs the matching `dox_http_native` change (`NativeResponse.hasRoom`).
 - A cancelled call ends its answer only after its handler really ended. The native server counts a call until its answer ends, so a client that cancels calls fast can not pile up handler work and memory (Rapid Reset). A unary or client streaming handler is waited for. A streaming handler is cancelled, and its end is waited for (an `async*` method ends when its body exits). A call past its deadline (or its idle timeout) sends `DEADLINE_EXCEEDED` once its handler ended, or after 30 seconds if the handler still runs. A cancelled call whose handler never ends stops counting after 30 seconds (in `dox_http_native`).
 - Tested with real gRPC tools in CI: the grpc-go interop suite (straight, behind nginx and behind Caddy) and `grpcurl`. Adds the `dox-grpc-guide` skill.

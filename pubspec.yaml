@@ -8,6 +8,7 @@ environment:
   sdk: ^3.13.0
 
 dependencies:
+  dox_annotation: ^3.2.0
   dox_core: ^3.2.3
   dox_http_native: ^3.2.1
   grpc: ^5.2.0
@@ -17,3 +18,7 @@ dev_dependencies:
   http2: ^2.3.1
   lints: ^6.1.0
   test: ^1.33.0
+
+# The `dox` CLI finds the commands of this package here (`dox grpc:install`).
+dox:
+  commands: package:dox_grpc/commands.dart
