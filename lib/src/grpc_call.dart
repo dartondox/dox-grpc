@@ -59,6 +59,16 @@ class GrpcCall implements ServiceCall {
 
   /// true once the response headers are set on the response
   bool _headWritten = false;
+
+  /// true once the handler ended (its answer stream is done or failed)
+  bool _handlerDone = false;
+
+  /// the status that waits to go out, see [_finish]
+  Map<String, String>? _status;
+
+  /// completes when a single answer that is still on its way ends, see
+  /// [_stopAll]
+  Completer<void>? _lateAnswer;
   bool _received = false;
 
   /// the one message of a call with a single request. It goes to the
@@ -428,9 +438,13 @@ class GrpcCall implements ServiceCall {
     if (responses != null && responses.isPaused) responses.resume();
   }
 
-  void _onMethodDone() => _endWith(GrpcException(GrpcStatus.ok));
+  void _onMethodDone() {
+    _handlerDone = true;
+    _endWith(GrpcException(GrpcStatus.ok));
+  }
 
   void _onMethodError(Object error, StackTrace stackTrace) {
+    _handlerDone = true;
     _endWith(_toException(error, stackTrace));
   }
 
@@ -503,8 +517,25 @@ class GrpcCall implements ServiceCall {
     if (error.details.isNotEmpty) {
       trailers['grpc-status-details-bin'] = _details(error);
     }
+    _status = trailers;
+    if (_canceled) {
+      // past the deadline (or idle): the status waits for the handler, so
+      // the native server counts the call until the handler really ended
+      _endAfterHandler();
+      return;
+    }
+    _finish(null);
+    _stopAll();
+  }
+
+  /// Sends [_status] (when set) and ends the answer.
+  void _finish(Object? _) {
+    Map<String, String>? trailers = _status;
+    _status = null;
     try {
-      if (_headWritten) {
+      if (trailers == null) {
+        // the client is gone: no status
+      } else if (_headWritten) {
         trailers.forEach(_setCustomTrailer);
       } else {
         _writeHead();
@@ -519,12 +550,25 @@ class GrpcCall implements ServiceCall {
       } catch (error, stackTrace) {
         _errors.reportFor(_request, error, stackTrace);
       }
-      _stopAll();
       _finished.complete();
     }
   }
 
-  /// The client left or reset the stream: stop, send nothing.
+  /// Stops the handler, and ends the answer only once the handler really
+  /// ended. A Dart handler can not be killed. The native server counts a
+  /// call against `maxConcurrentStreams` until its answer ends, so a client
+  /// that cancels calls fast can not pile up handler work. A handler that
+  /// never ends: the native server stops counting it after 30 s.
+  void _endAfterHandler() {
+    Future<void>? running = _stopAll();
+    if (running == null) {
+      _finish(null);
+    } else {
+      running.then(_finish);
+    }
+  }
+
+  /// The client left or reset the stream: stop, send no status.
   void _cancel() {
     if (_ended) return;
     _ended = true;
@@ -541,28 +585,34 @@ class GrpcCall implements ServiceCall {
     if (requests != null && !requests.isClosed) {
       requests.addError(GrpcError.cancelled('Cancelled'));
     }
-    _stream.end();
-    _stopAll();
-    _finished.complete();
+    _status = null;
+    _endAfterHandler();
   }
 
-  void _stopAll() {
+  /// Stops reading and stops the handler. Returns a Future that completes
+  /// once the handler really ended, or null when it is not running.
+  Future<void>? _stopAll() {
     StreamController<dynamic>? requests = _requests;
     if (requests != null && !requests.isClosed) requests.close();
     _queued.clear();
     _incoming?.cancel();
     StreamSubscription<dynamic>? responses = _responses;
-    if (responses == null) return;
+    if (responses == null || _handlerDone) return null;
     if (_method!.streamingResponse) {
-      // a stream stops here. An error of its cleanup comes with the cancel.
-      responses.cancel().then(_ignore, onError: _reportLate);
-    } else {
-      // a single answer is still on its way, maybe with an error. Keep
-      // listening, so a late error is reported and not lost.
-      responses
-        ..onData(_ignore)
-        ..onError(_reportLate);
+      // a stream stops here. The cancel of an async* method completes when
+      // its body exited (after its await and its finally blocks). An error
+      // of its cleanup comes with the cancel.
+      return responses.cancel().then(_ignore, onError: _reportLate);
     }
+    // a single answer is still on its way, maybe with an error. Keep
+    // listening, so a late error is reported and not lost, and so we know
+    // when the handler ended. A cancel would not wait for it.
+    Completer<void> late = _lateAnswer = Completer<void>();
+    responses
+      ..onData(_ignore)
+      ..onError(_onLateError)
+      ..onDone(_onLateDone);
+    return late.future;
   }
 
   static void _ignore(Object? _) {}
@@ -571,6 +621,20 @@ class GrpcCall implements ServiceCall {
   /// status already, so the error is only reported.
   void _reportLate(Object error, StackTrace stackTrace) {
     _toException(error, stackTrace);
+  }
+
+  /// the single answer failed after the call ended (it is cancelled on
+  /// error, so no done comes)
+  void _onLateError(Object error, StackTrace stackTrace) {
+    _reportLate(error, stackTrace);
+    _onLateDone();
+  }
+
+  void _onLateDone() {
+    _handlerDone = true;
+    Completer<void>? late = _lateAnswer;
+    _lateAnswer = null;
+    late?.complete();
   }
 
   /// `google.rpc.Status` with the details, base64 for the `-bin` header
