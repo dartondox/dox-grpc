@@ -33,3 +33,55 @@ jobs:
       - run: dart test
       - run: dart pub publish --dry-run
 
+
+  # Real gRPC tools against a Dox server: the grpc-go interop client
+  # (straight and behind nginx and Caddy) and grpcurl. See ci/interop.sh.
+  interop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: direct
+            isolates: 1
+          # 2 isolates: the health sync between isolates is checked here
+          - mode: grpcurl
+            isolates: 2
+          - mode: nginx
+            isolates: 1
+          - mode: caddy
+            isolates: 1
+    name: interop (${{ matrix.mode }})
+    env:
+      GRPC_GO_VERSION: v1.85.0
+      GRPCURL_VERSION: v1.9.4
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+      - run: ci/use-siblings.sh
+      - uses: Swatinem/rust-cache@v2
+        if: github.ref_type != 'tag'
+        with:
+          workspaces: |
+            ../dox-http-native/native -> target
+      - run: ci/use-siblings.sh build
+      - run: dart pub get
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - uses: actions/cache@v4
+        with:
+          path: ~/go/bin
+          key: interop-tools-${{ runner.os }}-${{ env.GRPC_GO_VERSION }}-${{ env.GRPCURL_VERSION }}
+      - name: Install the interop client and grpcurl
+        run: |
+          [ -x ~/go/bin/client ] || go install google.golang.org/grpc/interop/client@$GRPC_GO_VERSION
+          [ -x ~/go/bin/grpcurl ] || go install github.com/fullstorydev/grpcurl/cmd/grpcurl@$GRPCURL_VERSION
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+      - run: ci/interop.sh ${{ matrix.mode }}
+        env:
+          ISOLATES: ${{ matrix.isolates }}
