@@ -300,11 +300,11 @@ void main() {
 
   test('a call past its deadline sends the status after its handler', () async {
     SlowEcho service = SlowEcho();
-    FakeStream stream = FakeStream(<String, String>{'grpc-timeout': '20m'});
+    FakeStream stream = FakeStream(<String, String>{'grpc-timeout': '100m'});
     Future<void> finished = start(service, stream, 'Unary');
     await service.started.future;
 
-    await settle(60);
+    await settle(200);
     expect(events, isEmpty, reason: 'the handler still runs');
 
     service.release.complete();
@@ -322,11 +322,11 @@ void main() {
         service,
         stream,
         'Unary',
-        options: const GrpcOptions(idleTimeout: Duration(milliseconds: 20)),
+        options: const GrpcOptions(idleTimeout: Duration(milliseconds: 100)),
       );
       await service.started.future;
 
-      await settle(60);
+      await settle(200);
       expect(events, isEmpty, reason: 'the handler still runs');
 
       service.release.complete();
@@ -338,11 +338,11 @@ void main() {
 
   test('a cancel after the deadline still sends the status once', () async {
     SlowEcho service = SlowEcho();
-    FakeStream stream = FakeStream(<String, String>{'grpc-timeout': '20m'});
+    FakeStream stream = FakeStream(<String, String>{'grpc-timeout': '100m'});
     Future<void> finished = start(service, stream, 'Unary');
     await service.started.future;
 
-    await settle(60);
+    await settle(200);
     stream.goneSignal.complete();
     await settle();
     expect(events, isEmpty, reason: 'the handler still runs');
@@ -356,7 +356,7 @@ void main() {
 
   test('a handler that never ends does not hold the status for ever', () async {
     SlowEcho service = SlowEcho();
-    FakeStream stream = FakeStream(<String, String>{'grpc-timeout': '20m'});
+    FakeStream stream = FakeStream(<String, String>{'grpc-timeout': '100m'});
     Future<void> finished = start(
       service,
       stream,

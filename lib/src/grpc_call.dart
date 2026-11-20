@@ -560,13 +560,21 @@ class GrpcCall implements ServiceCall {
         trailers.forEach(_setCustomHeader);
       }
     } catch (error, stackTrace) {
-      _reportBadMetadata('status', 'grpc-status', error, stackTrace);
+      try {
+        _reportBadMetadata('status', 'grpc-status', error, stackTrace);
+      } catch (_) {
+        // the app's error reporter threw: the call must still end
+      }
     } finally {
       // the call must always end, or the client waits for ever
       try {
         _stream.end();
       } catch (error, stackTrace) {
-        _errors.reportFor(_request, error, stackTrace);
+        try {
+          _errors.reportFor(_request, error, stackTrace);
+        } catch (_) {
+          // the app's error reporter threw: the call must still end
+        }
       }
       _finished.complete();
     }
