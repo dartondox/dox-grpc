@@ -144,6 +144,10 @@ void main() {
         totalIsolate: 1,
         http2: true,
         exceptionHandler: errors,
+        // gRPC routes skip it, so the slow stream below is not cut
+        globalMiddleware: <dynamic>[
+          const RequestTimeout(Duration(milliseconds: 300)),
+        ],
       ),
     );
     await Dox().startServer();
@@ -218,6 +222,13 @@ void main() {
     expect(replies.map((EchoReply r) => r.text), <String>[
       for (int i = 0; i < 100; i++) 'n$i',
     ]);
+  });
+
+  test('a stream longer than RequestTimeout is not cut', () async {
+    List<EchoReply> replies = await echo
+        .serverStream(EchoRequest(text: 's', count: 10, delayMs: 60))
+        .toList();
+    expect(replies, hasLength(10));
   });
 
   test('server streaming of 20 MiB (backpressure)', () async {
@@ -325,11 +336,11 @@ void main() {
     await callPath('/dox.test.Echo/Nope', grpcCode(StatusCode.unimplemented));
   });
 
-  test('an unknown service gets the Dox 404', () async {
-    // ponytail: Dox answers HTTP 404 before dox_grpc runs. package:grpc
-    // maps it to NOT_FOUND, grpc-go to UNIMPLEMENTED. A trailers-only 12
-    // needs a POST fallback in dox_core.
-    await callPath('/dox.test.Missing/Unary', grpcCode(StatusCode.notFound));
+  test('an unknown service is UNIMPLEMENTED', () async {
+    await callPath(
+      '/dox.test.Missing/Unary',
+      grpcCode(StatusCode.unimplemented),
+    );
   });
 
   test('deadline: DEADLINE_EXCEEDED, the server sees isTimedOut', () async {
@@ -363,7 +374,11 @@ void main() {
     GuardedEchoClient guarded = GuardedEchoClient(channel);
     await expectLater(
       guarded.unary(EchoRequest(text: 'x')),
-      throwsA(grpcCode(StatusCode.unauthenticated)),
+      throwsA(
+        isA<GrpcError>()
+            .having((GrpcError e) => e.code, 'code', StatusCode.unauthenticated)
+            .having((GrpcError e) => e.message, 'message', 'no token'),
+      ),
     );
     EchoReply ok = await guarded.unary(
       EchoRequest(text: 'x'),

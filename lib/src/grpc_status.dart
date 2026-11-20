@@ -31,6 +31,26 @@ enum GrpcStatus {
     if (code < 0 || code >= values.length) return unknown;
     return values[code];
   }
+
+  /// The status for an HTTP error code, eg. from a middleware. 401 is
+  /// [unauthenticated], 403 [permissionDenied], 404 [notFound], 429
+  /// [resourceExhausted], 503 [unavailable]. Another 4xx is
+  /// [failedPrecondition], another 5xx is [internal].
+  static GrpcStatus fromHttp(int code) {
+    return switch (code) {
+      400 || 422 => invalidArgument,
+      401 => unauthenticated,
+      403 => permissionDenied,
+      404 => notFound,
+      408 || 504 => deadlineExceeded,
+      409 => aborted,
+      413 || 429 => resourceExhausted,
+      501 => unimplemented,
+      502 || 503 => unavailable,
+      >= 400 && < 500 => failedPrecondition,
+      _ => internal,
+    };
+  }
 }
 
 /// Throw it in a service method to end the call with [status].

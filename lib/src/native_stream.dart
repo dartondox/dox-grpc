@@ -34,8 +34,10 @@ class NativeGrpcStream {
   /// A client reset ends it with an [HttpException].
   Stream<Uint8List> get body => _request;
 
-  /// Completes when the response is sent or the client is gone.
-  Future<void> get done => _response.done;
+  /// Completes once, when the client is gone (it reset the stream or the
+  /// connection died) before the answer was sent. Never completes for an
+  /// answer that ends normally.
+  Future<void> get gone => _response.gone;
 
   /// true once the status and the headers went out
   bool get headSent => _response.headSent;

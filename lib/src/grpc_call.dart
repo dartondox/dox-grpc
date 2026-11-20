@@ -4,6 +4,7 @@ import 'dart:typed_data';
 
 import 'package:dox_core/dox_core.dart';
 import 'package:dox_grpc/src/generated/google/rpc/status.pb.dart' as rpc;
+import 'package:dox_grpc/src/grpc.dart';
 import 'package:dox_grpc/src/grpc_options.dart';
 import 'package:dox_grpc/src/grpc_status.dart';
 import 'package:dox_grpc/src/native_stream.dart';
@@ -78,8 +79,14 @@ class GrpcCall implements ServiceCall {
   @override
   DateTime? get deadline => _deadline;
 
+  /// true once the deadline passed. Also when the client cancelled at its
+  /// deadline before our timer ran.
   @override
-  bool get isTimedOut => _timedOut;
+  bool get isTimedOut {
+    DateTime? deadline = _deadline;
+    return _timedOut ||
+        (deadline != null && !DateTime.now().isBefore(deadline));
+  }
 
   @override
   bool get isCanceled => _canceled;
@@ -123,7 +130,7 @@ class GrpcCall implements ServiceCall {
       return _finished.future;
     }
 
-    _stream.done.then(_onResponseDone, onError: _onResponseDone);
+    _stream.gone.then(_onGone);
     Duration? timeout = GrpcWire.parseTimeout(
       requestHeaders.value('grpc-timeout'),
     );
@@ -250,10 +257,8 @@ class GrpcCall implements ServiceCall {
   /// the client reset the stream
   void _onBodyError(Object error) => _cancel();
 
-  /// the response is sent or the client is gone
-  void _onResponseDone(Object? _) {
-    if (!_ended) _cancel();
-  }
+  /// the client reset the stream or the connection died
+  void _onGone(void _) => _cancel();
 
   void _onTimeout() {
     if (_ended) return;
@@ -393,21 +398,14 @@ class GrpcCall implements ServiceCall {
 
   static String _trim(String text) => text.trim();
 
-  /// Any error as a gRPC status. An error that is not a gRPC error is
-  /// INTERNAL. It is reported, and its text is hidden outside debug mode.
+  /// Any error as a gRPC status. An error that is not a gRPC or HTTP error
+  /// is INTERNAL. It is reported, and its text is hidden outside debug mode.
   GrpcException _toException(Object error, StackTrace stackTrace) {
-    if (error is GrpcException) return error;
-    if (error is GrpcError) {
-      return GrpcException(
-        GrpcStatus.fromCode(error.code),
-        error.message,
-        error.details ?? const <GeneratedMessage>[],
-      );
+    if (error is! GrpcException &&
+        error is! GrpcError &&
+        !(error is IHttpException && error.code < 500)) {
+      _errors.reportFor(_request, error, stackTrace);
     }
-    _errors.reportFor(_request, error, stackTrace);
-    return GrpcException(
-      GrpcStatus.internal,
-      _debug ? '$error' : 'Internal error',
-    );
+    return GrpcServiceRoute.toGrpcException(error, debug: _debug);
   }
 }

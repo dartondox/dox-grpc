@@ -48,7 +48,7 @@ class GreeterService extends GreeterServiceBase {
 
 ## Register it
 
-A service gets the route `POST /<package.Service>/{method}`. The gRPC path has no prefix, so register it in a router with no prefix:
+A service gets the route `POST /<package.Service>/{method}`. gRPC clients call that exact path, so register the service in a router with **no prefix**. A router without a `prefix` getter has none. Do not put it in the `api` router:
 
 ```dart
 class GrpcRouter extends Router {
@@ -62,7 +62,9 @@ class GrpcRouter extends Router {
 }
 ```
 
-The middleware of the router runs before each call. `Route.middleware([...], () => Grpc.register(...))` works too.
+The middleware of the router runs before each call. `Route.middleware([...], () => Grpc.register(...))` works too. The gRPC routes skip `RequestTimeout`, so a long stream is not cut.
+
+A call to a service that is not registered gets `UNIMPLEMENTED`, and so does a method the service does not have.
 
 ## Errors
 
@@ -76,7 +78,7 @@ The message is sent in `grpc-message`. Protobuf messages in `details` are sent i
 
 A `GrpcError` from `package:grpc` works the same way, so code from `package:grpc` keeps working. Any other error ends the call with `INTERNAL`. It is reported to the `ExceptionHandler` like other Dox errors. The client sees its text only when `APP_ENV` is `development` or `local`.
 
-A middleware that throws a Dox HTTP error (eg. 401) sends a plain HTTP answer. gRPC clients turn the HTTP status into a gRPC status (401 is `UNAUTHENTICATED`).
+A middleware that throws a Dox HTTP error goes to the client as a gRPC error, with its message. 401 is `UNAUTHENTICATED`, 403 `PERMISSION_DENIED`, 404 `NOT_FOUND`, 422 `INVALID_ARGUMENT`, 429 `RESOURCE_EXHAUSTED` and 503 `UNAVAILABLE`.
 
 ## Metadata
 
@@ -114,10 +116,8 @@ Grpc.register(health);
 health.setStatus('helloworld.Greeter', ServingStatus.SERVING);
 ```
 
-The empty name `''` is the whole server and starts as `SERVING`. Each isolate has its own status, so set it in each isolate (eg. in a provider).
+The empty name `''` is the whole server and starts as `SERVING`. A change in one isolate goes to the other isolates of the app too (on the Dox `IsolateBus`).
 
 ## Not yet
 
-- An unknown service gets the normal Dox 404. gRPC clients see it as `UNIMPLEMENTED` (grpc-go) or `NOT_FOUND` (`package:grpc`). An unknown method of a known service gets `UNIMPLEMENTED`.
-- `RequestTimeout` as a global middleware also ends long streams. Leave it off for gRPC routes.
 - Server reflection and gRPC-Web.
