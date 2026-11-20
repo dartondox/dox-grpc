@@ -145,14 +145,14 @@ Grpc.register(
     maxReceiveMessageSize: 4 * 1024 * 1024,
     maxSendMessageSize: 4 * 1024 * 1024,
     gzipResponses: false,
-    idleTimeout: Duration(minutes: 5),
+    idleTimeout: Duration(minutes: 5), // default; null = no limit
   ),
 );
 ```
 
 - A message over the size limit ends the call with `RESOURCE_EXHAUSTED`. Both limits are 4 MiB by default, like other gRPC servers. The request limit also counts the bytes after unzip.
 - Requests in gzip are always read. Responses are zipped only with `gzipResponses: true`, and only for clients that accept gzip. It is off by default, because it costs CPU on each message.
-- `idleTimeout` is off by default. When it is set, a call with no message in or out for that long ends with `DEADLINE_EXCEEDED`. It frees the call of a client that never reads the answer, or a request that never ends (for example a unary call that never half-closes). The quiet time of your handler counts too, so set it longer than your slowest quiet handler. We suggest `Duration(minutes: 5)`. The deadline of the client (`grpc-timeout`) always works, with or without it.
+- `idleTimeout` is 5 minutes by default (Envoy also closes a stream idle for 5 minutes). A call with no message in or out for that long ends with `DEADLINE_EXCEEDED`. Without it, a quiet client could hold a call forever: one that never reads the answer, or a request that never ends (for example a unary call that never half-closes). The quiet time of your handler counts too, so set it longer than your slowest quiet handler. A quiet `Watch` or other long stream is closed the same way, and the client must reconnect, so send a message now and then or set a longer value. Pass `idleTimeout: null` for no limit. The deadline of the client (`grpc-timeout`) always works, with or without it.
 - When one part of the body holds many zipped messages, they are unzipped one per event loop turn, so one stream can not hold the isolate. The unzipped size of each message is limited by `maxReceiveMessageSize`.
 - A request error (a message that is too big, not valid, or cut short, or a second message in a unary call) reaches your method as an error in its request stream. A unary method is called only when its one message is complete.
 
