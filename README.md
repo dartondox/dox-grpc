@@ -51,6 +51,14 @@ class GreeterService extends GreeterServiceBase {
 A service gets the route `POST /<package.Service>/{method}`. gRPC clients call that exact path, so register the service in a router with **no prefix**. A router without a `prefix` getter has none. Do not put it in the `api` router:
 
 ```dart
+// no middleware: load balancers call the health check without a token
+class HealthRouter extends Router {
+  @override
+  void register() {
+    Grpc.register(HealthService());
+  }
+}
+
 class GrpcRouter extends Router {
   @override
   List<dynamic> get middleware => <dynamic>[AuthMiddleware()];
@@ -62,7 +70,7 @@ class GrpcRouter extends Router {
 }
 ```
 
-The middleware of the router runs before each call. `Route.middleware([...], () => Grpc.register(...))` works too, but not for the first `Grpc.register` (see below). The gRPC routes skip `RequestTimeout`, so a long stream is not cut.
+The middleware of the router runs before each call. Keep the health service out of a router with auth middleware, or a load balancer's health check gets `UNAUTHENTICATED`. `Route.middleware([...], () => Grpc.register(...))` works too, but not for the first `Grpc.register` (see below). The gRPC routes skip `RequestTimeout`, so a long stream is not cut.
 
 A call to a service that is not registered gets `UNIMPLEMENTED`, and so does a method the service does not have.
 
@@ -107,6 +115,13 @@ A middleware that throws a Dox HTTP error goes to the client as a gRPC error, wi
 
 - `call.clientMetadata` has the request headers, except the `grpc-*` ones.
 - Set `call.headers` before the first message, and `call.trailers` before the end.
+- The three maps are nullable in `ServiceCall`, so use `!`. In Dox they are always there until the call sends them.
+
+```dart
+String? requestId = call.clientMetadata!['x-request-id'];
+call.headers!['x-request-id'] = requestId ?? 'none';
+call.trailers!['x-done'] = 'yes';
+```
 - A `-bin` value stays base64 text, as in `package:grpc`. `GrpcWire.decodeBinary` gives its bytes (with or without padding), and `GrpcWire.encodeBinary` makes one.
 
 ## Deadlines and cancel
@@ -144,6 +159,15 @@ health.setStatus('helloworld.Greeter', ServingStatus.SERVING);
 ```
 
 The empty name `''` is the whole server and starts as `SERVING`. A change in one isolate goes to the other isolates of the app too (on the Dox `IsolateBus`). Each isolate joins when the server starts there, and its first `Check` or `Watch` waits a short time (up to 300 ms, once per isolate) for the other isolates to tell their status. Before the server starts, a status is only kept in the isolate (so a script that only loads the routes still exits).
+
+## Tested with
+
+- The gRPC interop suite: the grpc-go interop client runs `empty_unary`, `large_unary`, `client_streaming`, `server_streaming`, `ping_pong`, `empty_stream`, `timeout_on_sleeping_server`, `cancel_after_begin`, `cancel_after_first_response`, `status_code_and_message`, `special_status_message`, `custom_metadata`, `unimplemented_method` and `unimplemented_service` against a Dox server.
+- `grpcurl` with `-plaintext` and `.proto` files: a unary call, a server stream and the health check.
+- The same interop cases behind nginx (`grpc_pass grpc://...`) and Caddy (`reverse_proxy h2c://...`).
+- The `package:grpc` client, in the tests of this repo (with gzip).
+
+CI runs all of them on each change. See `ci/interop.sh`.
 
 ## Not yet
 
