@@ -106,6 +106,11 @@ class Grpc {
 
   /// Same kinds, in order. A router makes its middleware list again on each
   /// call, so the objects themselves can not be compared.
+  ///
+  /// Known limit: the kinds are all we have. `RouteData` does not say which
+  /// router a list came from. So a `Route.middleware([Auth], ...)` in a
+  /// router A is not seen when another router B has `[Auth]` as its own
+  /// middleware: both lists look the same.
   static bool _sameItems(List<dynamic> a, List<dynamic> b) {
     if (a.length != b.length) return false;
     for (int i = 0; i < a.length; i++) {

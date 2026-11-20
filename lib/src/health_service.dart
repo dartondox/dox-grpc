@@ -149,7 +149,6 @@ class HealthService extends HealthServiceBase {
 
   /// the status of [service], null when it is unknown
   ServingStatus? statusOf(String service) {
-    join();
     (int, int)? entry = _entries[service];
     if (entry == null || entry.$1 < 0) return null;
     return ServingStatus.valueOf(entry.$1);
@@ -158,24 +157,30 @@ class HealthService extends HealthServiceBase {
   /// Listens to the other isolates, once per isolate, and asks them for
   /// what they have. Dox calls it when the server starts in each isolate.
   /// Later calls do nothing.
+  ///
+  /// Before this, a status is only kept in this isolate (a script that
+  /// only loads the routes must not open a port, or it never exits). Here
+  /// it is sent to the other isolates.
   void join() {
     if (_joins[this] != null) return;
     _Join state = _joins[this] = _Join();
     state.subscription = _sync.messages.listen(_onMessage);
     _sync.publish(const HealthSyncRequest());
+    _entries.forEach(_send);
   }
 
-  /// Waits (at most [syncWait]) until the other isolates told what they
-  /// have, so the first answer of a new isolate is not stale. It does not
-  /// wait in an app with one isolate, or when the sync is done.
+  /// Waits (at most [syncWait], once per isolate) until the other isolates
+  /// told what they have, so the first answer of a new isolate is not
+  /// stale. It does not wait in an app with one isolate, or when the sync
+  /// is done. After a timeout the sync counts as done, so a silent isolate
+  /// costs one wait, not one per call.
   Future<void> _synced() async {
-    join();
-    Completer<void> done = _joins[this]!.synced;
+    _Join? state = _joins[this];
+    if (state == null) return;
+    Completer<void> done = state.synced;
     if (done.isCompleted || _sync.peers < 1) return;
-    await done.future.timeout(syncWait, onTimeout: _nothing);
+    await done.future.timeout(syncWait, onTimeout: state.giveUp);
   }
-
-  static void _nothing() {}
 
   @override
   Future<HealthCheckResponse> check(
@@ -203,10 +208,9 @@ class HealthService extends HealthServiceBase {
   }
 
   void _change(String service, int value) {
-    join();
     int now = DateTime.now().microsecondsSinceEpoch;
     _clock = now > _clock ? now : _clock + 1;
-    if (_apply(service, value, _clock)) {
+    if (_apply(service, value, _clock) && _joins[this] != null) {
       _sync.publish(HealthChange(service, value, _clock));
     }
   }
@@ -215,7 +219,11 @@ class HealthService extends HealthServiceBase {
   bool _apply(String service, int value, int at) {
     if (at > _clock) _clock = at;
     (int, int)? old = _entries[service];
-    if (old != null && old.$2 >= at) return false;
+    // the same time (two isolates, the same microsecond): the bigger value
+    // wins, so every isolate ends with the same status
+    if (old != null && (old.$2 > at || (old.$2 == at && old.$1 >= value))) {
+      return false;
+    }
     _entries[service] = (value, at);
     if (old?.$1 != value) _changes.add(service);
     return true;
@@ -288,6 +296,11 @@ class _Join {
 
   /// completes when another isolate said it told all it has
   final Completer<void> synced = Completer<void>();
+
+  /// the wait for the other isolates ended without their answer
+  void giveUp() {
+    if (!synced.isCompleted) synced.complete();
+  }
 }
 
 /// Joins the bus when the server starts in an isolate, so the first

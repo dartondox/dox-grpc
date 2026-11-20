@@ -62,11 +62,11 @@ class GrpcRouter extends Router {
 }
 ```
 
-The middleware of the router runs before each call. `Route.middleware([...], () => Grpc.register(...))` works too. The gRPC routes skip `RequestTimeout`, so a long stream is not cut.
+The middleware of the router runs before each call. `Route.middleware([...], () => Grpc.register(...))` works too, but not for the first `Grpc.register` (see below). The gRPC routes skip `RequestTimeout`, so a long stream is not cut.
 
 A call to a service that is not registered gets `UNIMPLEMENTED`, and so does a method the service does not have.
 
-If a prefix or a `Route.group` changes the route path, `Grpc.register` throws a `StateError` at start. No client could reach that route. The first service must also be registered outside `Route.middleware`, because the `UNIMPLEMENTED` answer for unknown services is added with it.
+If a prefix or a `Route.group` changes the route path, `Grpc.register` throws a `StateError` at start. No client could reach that route. The first `Grpc.register` (for example, the `HealthService`) must be outside `Route.middleware`, because the `UNIMPLEMENTED` answer for unknown services is added with it. Later ones may be inside.
 
 ## Services run in every isolate
 
@@ -143,7 +143,7 @@ Grpc.register(health);
 health.setStatus('helloworld.Greeter', ServingStatus.SERVING);
 ```
 
-The empty name `''` is the whole server and starts as `SERVING`. A change in one isolate goes to the other isolates of the app too (on the Dox `IsolateBus`). Each isolate joins when the server starts there, and its first `Check` or `Watch` waits a short time (up to 300 ms) for the other isolates to tell their status.
+The empty name `''` is the whole server and starts as `SERVING`. A change in one isolate goes to the other isolates of the app too (on the Dox `IsolateBus`). Each isolate joins when the server starts there, and its first `Check` or `Watch` waits a short time (up to 300 ms, once per isolate) for the other isolates to tell their status. Before the server starts, a status is only kept in the isolate (so a script that only loads the routes still exits).
 
 ## Not yet
 

@@ -66,8 +66,14 @@ class GrpcCall implements ServiceCall {
   /// message never runs the handler.
   dynamic _single;
 
-  /// frames that wait their turn, see [_onPart]
+  /// frames that wait their turn, see [_pump]
   final Queue<GrpcFrame> _queued = Queue<GrpcFrame>();
+
+  /// true while [_incoming] is held paused because of [_queued]
+  bool _holding = false;
+
+  /// true while a pump waits for the next event loop turn
+  bool _turnPending = false;
 
   /// the `grpc-encoding` of the request, lower case
   String? _requestEncoding;
@@ -158,8 +164,9 @@ class GrpcCall implements ServiceCall {
     );
     // read only when the method listens to its requests
     incoming.pause();
+    // the gate tells us when the handler reads again, see [_pump]
     StreamController<dynamic> requests = _requests = method.createRequestStream(
-      incoming,
+      _RequestGate(incoming, this),
     );
 
     try {
@@ -206,43 +213,64 @@ class GrpcCall implements ServiceCall {
     _clientMetadata[name] = values.join(',');
   }
 
-  /// One part of the body. Messages that need unzip, when there are many
-  /// in this part, are done one per event loop turn (see [_drain]). So a
-  /// small zipped part with hundreds of messages can not hold the isolate.
-  /// The usual part (no zip, or one message) is done at once.
+  /// One part of the body. The frames go to [_queued] and [_pump] hands
+  /// them over. The usual part (one message) is done at once.
   void _onPart(Uint8List part) {
     if (_ended) return;
     _touch();
-    List<GrpcFrame> frames;
     try {
-      frames = _reader.add(part);
+      _queued.addAll(_reader.add(part));
     } on GrpcException catch (error) {
       _failRequest(error);
       return;
     }
-    if (frames.length > 1 && frames.any(_isCompressed)) {
-      _queued.addAll(frames);
-      _drain();
-      return;
-    }
-    for (GrpcFrame frame in frames) {
+    _pump();
+  }
+
+  /// Hands the queued frames to the handler, while it reads. When the
+  /// handler pauses its request stream, the rest waits here and the body is
+  /// held, so one big part with many small messages can not fill the memory
+  /// of a slow handler. A zipped message is done one per event loop turn,
+  /// so a small zipped part with hundreds of messages can not hold the
+  /// isolate. The usual part (one message) needs no wait.
+  void _pump() {
+    if (_turnPending) return;
+    ServiceMethod<dynamic, dynamic> method = _method!;
+    while (_queued.isNotEmpty && !_ended) {
+      if (method.streamingRequest && _requests!.isPaused) break;
+      GrpcFrame frame = _queued.removeFirst();
       if (!_handleFrame(frame)) return;
+      if (_queued.isEmpty || !method.streamingRequest) continue;
+      // The request stream gives its events later. Wait for that, so a
+      // handler that pauses on the first message is seen before the next
+      // one. A zipped message waits a whole event loop turn.
+      _turnPending = true;
+      if (frame.compressed) {
+        Future<void>.delayed(Duration.zero, _nextTurn);
+      } else {
+        scheduleMicrotask(_nextTurn);
+      }
+      break;
+    }
+    if (_ended) return;
+    if (_queued.isNotEmpty && !_holding) {
+      _holding = true;
+      _incoming!.pause();
+    } else if (_queued.isEmpty && _holding) {
+      _holding = false;
+      _incoming!.resume();
     }
   }
 
-  static bool _isCompressed(GrpcFrame frame) => frame.compressed;
+  void _nextTurn() {
+    _turnPending = false;
+    _pump();
+  }
 
-  /// Handles the queued frames, and waits one event loop turn after each.
-  /// The body is paused meanwhile, so no part comes in between.
-  Future<void> _drain() async {
-    StreamSubscription<Uint8List> incoming = _incoming!;
-    incoming.pause();
-    while (_queued.isNotEmpty && !_ended) {
-      if (!_handleFrame(_queued.removeFirst())) break;
-      await Future<void>.delayed(Duration.zero);
-    }
-    _queued.clear();
-    if (!_ended) incoming.resume();
+  /// the handler resumed its request stream. Later, so the controller is
+  /// in its new state.
+  void _onHandlerResume() {
+    if (_queued.isNotEmpty) scheduleMicrotask(_pump);
   }
 
   /// false when the call ended because of this frame
@@ -377,7 +405,14 @@ class GrpcCall implements ServiceCall {
       return;
     }
     if (_gzipResponses) bytes = GrpcWire.gzipEncode(bytes);
-    if (!_headWritten) _writeHead();
+    if (!_headWritten) {
+      try {
+        _writeHead();
+      } catch (error, stackTrace) {
+        _endWith(_toException(error, stackTrace));
+        return;
+      }
+    }
     _stream.add(GrpcWire.frame(bytes, compressed: _gzipResponses));
     _touch();
     if (!method.streamingResponse) return;
@@ -410,16 +445,41 @@ class GrpcCall implements ServiceCall {
     _headers = null;
   }
 
+  /// A header the native server refuses (eg. a value with a non-ASCII
+  /// letter or a control char) is dropped and reported. The call goes on,
+  /// and it still ends with its own status.
   void _setCustomHeader(String name, String value) {
     String lower = name.toLowerCase();
     if (lower.startsWith(':') || lower == 'content-type') return;
-    _stream.setHeader(lower, value);
+    try {
+      _stream.setHeader(lower, value);
+    } catch (error, stackTrace) {
+      _reportBadMetadata('header', lower, error, stackTrace);
+    }
   }
 
+  /// like [_setCustomHeader], for a trailer
   void _setCustomTrailer(String name, String value) {
     String lower = name.toLowerCase();
     if (lower.startsWith(':') || lower == 'content-type') return;
-    _stream.setTrailer(lower, value);
+    try {
+      _stream.setTrailer(lower, value);
+    } catch (error, stackTrace) {
+      _reportBadMetadata('trailer', lower, error, stackTrace);
+    }
+  }
+
+  void _reportBadMetadata(
+    String kind,
+    String name,
+    Object error,
+    StackTrace stackTrace,
+  ) {
+    _errors.reportFor(
+      _request,
+      StateError('dox_grpc: dropped the $kind "$name": $error'),
+      stackTrace,
+    );
   }
 
   /// Ends the call with [error] (or OK). Before any message this is a
@@ -443,15 +503,25 @@ class GrpcCall implements ServiceCall {
     if (error.details.isNotEmpty) {
       trailers['grpc-status-details-bin'] = _details(error);
     }
-    if (_headWritten) {
-      trailers.forEach(_setCustomTrailer);
-    } else {
-      _writeHead();
-      trailers.forEach(_setCustomHeader);
+    try {
+      if (_headWritten) {
+        trailers.forEach(_setCustomTrailer);
+      } else {
+        _writeHead();
+        trailers.forEach(_setCustomHeader);
+      }
+    } catch (error, stackTrace) {
+      _reportBadMetadata('status', 'grpc-status', error, stackTrace);
+    } finally {
+      // the call must always end, or the client waits for ever
+      try {
+        _stream.end();
+      } catch (error, stackTrace) {
+        _errors.reportFor(_request, error, stackTrace);
+      }
+      _stopAll();
+      _finished.complete();
     }
-    _stream.end();
-    _stopAll();
-    _finished.complete();
   }
 
   /// The client left or reset the stream: stop, send nothing.
@@ -479,8 +549,28 @@ class GrpcCall implements ServiceCall {
   void _stopAll() {
     StreamController<dynamic>? requests = _requests;
     if (requests != null && !requests.isClosed) requests.close();
+    _queued.clear();
     _incoming?.cancel();
-    _responses?.cancel();
+    StreamSubscription<dynamic>? responses = _responses;
+    if (responses == null) return;
+    if (_method!.streamingResponse) {
+      // a stream stops here. An error of its cleanup comes with the cancel.
+      responses.cancel().then(_ignore, onError: _reportLate);
+    } else {
+      // a single answer is still on its way, maybe with an error. Keep
+      // listening, so a late error is reported and not lost.
+      responses
+        ..onData(_ignore)
+        ..onError(_reportLate);
+    }
+  }
+
+  static void _ignore(Object? _) {}
+
+  /// An error of the handler after the call ended. The client has its
+  /// status already, so the error is only reported.
+  void _reportLate(Object error, StackTrace stackTrace) {
+    _toException(error, stackTrace);
   }
 
   /// `google.rpc.Status` with the details, base64 for the `-bin` header
@@ -507,4 +597,41 @@ class GrpcCall implements ServiceCall {
     }
     return GrpcServiceRoute.toGrpcException(error, debug: _debug);
   }
+}
+
+/// The body subscription, as the request stream of the method sees it. A
+/// resume tells the call, so it can hand over the frames that waited.
+class _RequestGate implements StreamSubscription<Uint8List> {
+  _RequestGate(this._inner, this._call);
+
+  final StreamSubscription<Uint8List> _inner;
+  final GrpcCall _call;
+
+  @override
+  void pause([Future<void>? resumeSignal]) => _inner.pause(resumeSignal);
+
+  @override
+  void resume() {
+    _inner.resume();
+    _call._onHandlerResume();
+  }
+
+  @override
+  bool get isPaused => _inner.isPaused;
+
+  @override
+  Future<void> cancel() => _inner.cancel();
+
+  @override
+  void onData(void Function(Uint8List data)? handleData) =>
+      _inner.onData(handleData);
+
+  @override
+  void onError(Function? handleError) => _inner.onError(handleError);
+
+  @override
+  void onDone(void Function()? handleDone) => _inner.onDone(handleDone);
+
+  @override
+  Future<E> asFuture<E>([E? futureValue]) => _inner.asFuture(futureValue);
 }

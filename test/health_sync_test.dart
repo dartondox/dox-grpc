@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:dox_grpc/dox_grpc.dart';
 import 'package:test/test.dart';
@@ -40,6 +41,9 @@ class FakeSync implements HealthSync {
 
   @override
   int get peers => bus.members.length - 1;
+
+  /// a message from another isolate
+  void deliver(HealthMessage message) => _in.add(message);
 }
 
 /// the calls of `check` do not use the call
@@ -73,6 +77,7 @@ void main() {
   test('an isolate that joins late gets the current status', () async {
     FakeBus bus = FakeBus();
     HealthService a = HealthService(sync: bus.join());
+    a.join();
     a.setStatus('svc', ServingStatus.SERVING);
     a.setStatus('svc', ServingStatus.NOT_SERVING);
     HealthService late = HealthService(sync: bus.join());
@@ -95,20 +100,62 @@ void main() {
     expect(b.statusOf('svc'), ServingStatus.NOT_SERVING);
   });
 
-  test('the constructor does not join the bus', () async {
+  test('before join, a status stays local and the bus is not used', () async {
     FakeBus bus = FakeBus();
     FakeSync sync = bus.join();
+    FakeSync other = bus.join();
     HealthService health = HealthService(sync: sync);
+    List<HealthMessage> seen = <HealthMessage>[];
+    other.messages.listen(seen.add);
+    health.setStatus('svc', ServingStatus.NOT_SERVING);
+    health.clearStatus('x');
+    expect(health.statusOf('svc'), ServingStatus.NOT_SERVING);
+    await health.check(NoCall(), HealthCheckRequest()); // does not wait
+    await settle();
     expect(sync.joined, isFalse);
-    health.statusOf('');
+    expect(seen, isEmpty);
+    // at join, the local status goes out
+    health.join();
+    await settle();
     expect(sync.joined, isTrue);
+    expect(
+      seen.whereType<HealthChange>().map((HealthChange c) => c.service),
+      containsAll(<String>['svc', 'x']),
+    );
+  });
+
+  test('a tie on the time: every isolate ends with the same status', () async {
+    FakeBus bus = FakeBus();
+    FakeSync syncA = bus.join();
+    FakeSync syncB = bus.join();
+    HealthService a = HealthService(sync: syncA);
+    HealthService b = HealthService(sync: syncB);
+    a.join();
+    b.join();
+    await settle();
+    // the same time, different values, each isolate sees the other's last
+    HealthChange serving = HealthChange('svc', ServingStatus.SERVING.value, 5);
+    HealthChange notServing = HealthChange(
+      'svc',
+      ServingStatus.NOT_SERVING.value,
+      5,
+    );
+    syncA.deliver(serving);
+    syncB.deliver(notServing);
+    syncA.deliver(notServing);
+    syncB.deliver(serving);
+    await settle();
+    expect(a.statusOf('svc'), b.statusOf('svc'));
+    expect(a.statusOf('svc'), ServingStatus.NOT_SERVING);
   });
 
   test('the first Check of a late joiner is not stale', () async {
     FakeBus bus = FakeBus();
     HealthService a = HealthService(sync: bus.join());
+    a.join();
     a.setStatus('svc', ServingStatus.NOT_SERVING);
     HealthService late = HealthService(sync: bus.join());
+    late.join();
     // no settle: Check itself waits for the answer of the other isolate
     HealthCheckResponse res = await late.check(
       NoCall(),
@@ -122,8 +169,10 @@ void main() {
     () async {
       FakeBus bus = FakeBus();
       HealthService a = HealthService(sync: bus.join());
+      a.join();
       a.setStatus('svc', ServingStatus.NOT_SERVING);
       HealthService late = HealthService(sync: bus.join());
+      late.join();
       HealthCheckResponse first = await late
           .watch(NoCall(), HealthCheckRequest(service: 'svc'))
           .first;
@@ -134,23 +183,40 @@ void main() {
   test('with no other isolate, Check does not wait', () async {
     FakeBus bus = FakeBus();
     HealthService alone = HealthService(sync: bus.join());
+    alone.join();
     HealthCheckResponse res = await alone
         .check(NoCall(), HealthCheckRequest())
         .timeout(HealthService.syncWait ~/ 3);
     expect(res.status, ServingStatus.SERVING);
   });
 
-  test('Check waits only a short time for an isolate that is silent', () async {
+  test('a silent isolate costs one wait, not one per Check', () async {
     FakeBus bus = FakeBus();
     bus.join(); // a member that never answers
     HealthService health = HealthService(sync: bus.join());
+    health.join();
     Stopwatch watch = Stopwatch()..start();
     HealthCheckResponse res = await health.check(
       NoCall(),
       HealthCheckRequest(),
     );
     expect(res.status, ServingStatus.SERVING);
-    expect(watch.elapsed, lessThan(HealthService.syncWait * 5));
+    expect(watch.elapsed, greaterThan(HealthService.syncWait ~/ 2));
+    // the next ones do not wait again
+    watch.reset();
+    for (int i = 0; i < 3; i++) {
+      await health.check(NoCall(), HealthCheckRequest());
+    }
+    expect(watch.elapsed, lessThan(HealthService.syncWait ~/ 2));
+  });
+
+  test('a script that only loads the routes exits', () async {
+    ProcessResult res = await Process.run(Platform.resolvedExecutable, <String>[
+      'run',
+      'test/fixtures/load_routes.dart',
+    ]).timeout(const Duration(seconds: 90));
+    expect(res.exitCode, 0, reason: '${res.stdout}${res.stderr}');
+    expect(res.stdout, contains('routes loaded'));
   });
 
   test('messages go to the wire and back', () {

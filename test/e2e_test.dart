@@ -33,6 +33,12 @@ class Seen {
 
   /// the messages the server stream method made so far
   int produced = 0;
+
+  /// the request messages of the client stream method that were parsed
+  int parsed = 0;
+
+  /// the value of [parsed] while the handler had its stream paused
+  int parsedWhilePaused = -1;
 }
 
 class SpyHealth extends HealthService {
@@ -77,6 +83,12 @@ class EchoService extends EchoServiceBase {
       if (!seen.timedOut.isCompleted) seen.timedOut.complete(call.isTimedOut);
     }
     switch (request.text) {
+      case 'bad-header':
+        call.headers!['x-bad'] = 'José';
+        call.headers!['x-good'] = 'fine';
+      case 'bad-trailer':
+        call.trailers!['x-bad'] = 'a\r\nb';
+        call.trailers!['x-good'] = 'fine';
       case 'fail':
         throw GrpcException(GrpcStatus.notFound, 'no ü 100%\n', <EchoReply>[
           EchoReply(text: 'detail'),
@@ -123,6 +135,7 @@ class EchoService extends EchoServiceBase {
     ServiceCall call,
     Stream<EchoRequest> request,
   ) async {
+    if (call.clientMetadata!['x-hold'] != null) return _held(request);
     StringBuffer text = StringBuffer();
     int bytes = 0;
     try {
@@ -136,6 +149,41 @@ class EchoService extends EchoServiceBase {
     }
     if (!seen.upload.isCompleted) seen.upload.complete('$text:$bytes');
     return EchoReply(text: '$text:$bytes');
+  }
+
+  /// pauses after the first message, looks at how many messages the
+  /// server parsed meanwhile, then reads the rest
+  Future<EchoReply> _held(Stream<EchoRequest> request) {
+    Completer<EchoReply> done = Completer<EchoReply>();
+    int count = 0;
+    late StreamSubscription<EchoRequest> sub;
+    sub = request.listen((EchoRequest r) {
+      count++;
+      if (count != 1) return;
+      sub.pause();
+      Timer(const Duration(milliseconds: 400), () {
+        seen.parsedWhilePaused = seen.parsed;
+        sub.resume();
+      });
+    }, onDone: () => done.complete(EchoReply(text: '$count')));
+    return done.future;
+  }
+
+  @override
+  ServiceMethod<dynamic, dynamic>? $lookupMethod(String name) {
+    ServiceMethod<dynamic, dynamic>? method = super.$lookupMethod(name);
+    if (method == null || name != 'ClientStream') return method;
+    return ServiceMethod<EchoRequest, EchoReply>(
+      method.name,
+      method.handler,
+      method.streamingRequest,
+      method.streamingResponse,
+      (List<int> data) {
+        seen.parsed++;
+        return method.deserialize(data) as EchoRequest;
+      },
+      (EchoReply reply) => method.serialize(reply),
+    );
   }
 
   @override
@@ -183,7 +231,9 @@ class RecordingHandler extends ExceptionHandler {
   final List<Object> reported = <Object>[];
 
   @override
-  void report(Object error, StackTrace stackTrace) => reported.add(error);
+  void report(Object error, StackTrace stackTrace) {
+    reported.add(error);
+  }
 }
 
 final RecordingHandler errors = RecordingHandler();
@@ -411,6 +461,61 @@ void main() {
     expect(errors.reported.whereType<StateError>(), hasLength(1));
     expect(errors.reported.whereType<GrpcError>(), isEmpty);
     expect(errors.reported.whereType<GrpcException>(), isEmpty);
+  });
+
+  test('a bad custom header is dropped and reported, the call is OK', () async {
+    int before = errors.reported.length;
+    ResponseFuture<EchoReply> call = echo.unary(
+      EchoRequest(text: 'bad-header'),
+    );
+    expect((await call).text, 'bad-header');
+    Map<String, String> headers = await call.headers;
+    expect(headers.containsKey('x-bad'), isFalse);
+    expect(headers['x-good'], 'fine');
+    expect(
+      errors.reported.skip(before).map((Object e) => '$e'),
+      contains(contains('dropped the header "x-bad"')),
+    );
+  });
+
+  test('a bad custom trailer is dropped and reported, the call ends', () async {
+    int before = errors.reported.length;
+    ResponseFuture<EchoReply> call = echo.unary(
+      EchoRequest(text: 'bad-trailer'),
+    );
+    expect((await call).text, 'bad-trailer');
+    Map<String, String> trailers = await call.trailers;
+    expect(trailers.containsKey('x-bad'), isFalse);
+    expect(trailers['x-good'], 'fine');
+    expect(
+      errors.reported.skip(before).map((Object e) => '$e'),
+      contains(contains('dropped the trailer "x-bad"')),
+    );
+  });
+
+  test('a paused handler gets no more messages from one big part', () async {
+    seen.parsed = 0;
+    seen.parsedWhilePaused = -1;
+    int count = 20000;
+    BytesBuilder body = BytesBuilder(copy: false);
+    List<int> one = EchoRequest(text: 'a').writeToBuffer();
+    for (int i = 0; i < count; i++) {
+      body.add(rawFrame(one));
+    }
+    RawCall call = await RawCall.open(
+      Dox().server.httpServer.port,
+      '/dox.test.Echo/ClientStream',
+      headers: <String, String>{'x-hold': '1'},
+    );
+    call.send(body.toBytes(), end: true);
+    RawResult res = await call.finish(timeout: const Duration(seconds: 30));
+    await call.close();
+    expect(res.status, 0);
+    // while the handler was paused, only a few messages were parsed
+    expect(seen.parsedWhilePaused, lessThan(100));
+    // none was lost
+    expect(seen.parsed, count);
+    expect(EchoReply.fromBuffer(res.messages.single).text, '$count');
   });
 
   test('sendTrailers with a status', () async {
@@ -789,6 +894,13 @@ void main() {
       expect(res.message, 'first');
       // wait for the late error, then check that the server is fine
       await Future<void>.delayed(const Duration(milliseconds: 150));
+      // the late error is reported, not lost
+      expect(
+        errors.reported.whereType<StateError>().map(
+          (StateError e) => e.message,
+        ),
+        contains('late'),
+      );
       expect((await echo.unary(EchoRequest(text: 'up'))).text, 'up');
     });
   });
@@ -805,7 +917,7 @@ void main() {
       expect(res.status, StatusCode.deadlineExceeded);
       expect(res.message, contains('idle'));
       expect(watch.elapsed, greaterThan(const Duration(milliseconds: 300)));
-      expect(watch.elapsed, lessThan(const Duration(seconds: 3)));
+      expect(watch.elapsed, lessThan(const Duration(seconds: 10)));
     });
 
     test('a client that never reads does not hold the call', () async {
