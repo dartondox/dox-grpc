@@ -60,6 +60,11 @@ class NativeGrpcStream {
   /// Adds body bytes. They go out on [flush] or at the end.
   void add(List<int> bytes) => _response.add(bytes);
 
+  /// true when the native server has room for more answer bytes, so a
+  /// [flush] would complete at once. Before the first part it is false:
+  /// the first flush starts the stream.
+  bool get hasRoom => _response.hasRoom;
+
   /// Sends what was added. Completes when the native server has room for
   /// more, so a fast writer waits for a slow client.
   Future<void> flush() => _response.flush();

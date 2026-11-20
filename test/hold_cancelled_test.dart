@@ -58,8 +58,23 @@ class FakeStream implements NativeGrpcStream {
   @override
   void add(List<int> bytes) => events.add('message');
 
+  /// what [hasRoom] answers
+  bool room = false;
+
+  /// how many times the call flushed
+  int flushes = 0;
+
+  /// what a flush waits for (null: nothing)
+  Completer<void>? flushWait;
+
   @override
-  Future<void> flush() => Future<void>.value();
+  bool get hasRoom => room;
+
+  @override
+  Future<void> flush() {
+    flushes++;
+    return flushWait?.future ?? Future<void>.value();
+  }
 
   @override
   void end() => events.add('end');
@@ -141,6 +156,20 @@ class SlowEcho extends EchoServiceBase {
   @override
   Stream<EchoReply> bidi(ServiceCall call, Stream<EchoRequest> request) =>
       _stream();
+}
+
+/// A server stream of [count] messages, made one after the other.
+class CountEcho extends SlowEcho {
+  CountEcho(this.count);
+
+  final int count;
+
+  @override
+  Stream<EchoReply> serverStream(ServiceCall call, EchoRequest request) async* {
+    for (int i = 0; i < count; i++) {
+      yield EchoReply(text: 'm$i');
+    }
+  }
 }
 
 /// Records the reports. [fail] makes the report itself throw.
@@ -253,6 +282,37 @@ void main() {
     service.release.complete();
     await finished;
     expect(events, <String>['message', 'handler done', 'stream exit', 'end']);
+  });
+
+  group('room in the native window', () {
+    test('with room the handler is never paused', () async {
+      FakeStream stream = FakeStream()..room = true;
+      await start(CountEcho(50), stream, 'ServerStream');
+      expect(stream.flushes, 0);
+      expect(events.where((String e) => e == 'message'), hasLength(50));
+      expect(events.last, 'end');
+    });
+
+    test('with no room each message waits for its flush', () async {
+      FakeStream stream = FakeStream();
+      await start(CountEcho(50), stream, 'ServerStream');
+      expect(stream.flushes, 50);
+      expect(events.where((String e) => e == 'message'), hasLength(50));
+    });
+
+    test('a full window holds the handler back until the flush ends', () async {
+      FakeStream stream = FakeStream()..flushWait = Completer<void>();
+      Future<void> finished = start(CountEcho(50), stream, 'ServerStream');
+      await settle();
+      expect(events, <String>['message'], reason: 'paused after the first');
+      expect(stream.flushes, 1);
+
+      stream.room = true; // Rust sent the data: there is room again
+      stream.flushWait!.complete();
+      await finished;
+      expect(events.where((String e) => e == 'message'), hasLength(50));
+      expect(stream.flushes, 1, reason: 'no pause while there is room');
+    });
   });
 
   for (String method in <String>['Unary', 'ServerStream']) {
