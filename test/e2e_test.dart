@@ -325,29 +325,25 @@ void main() {
       rawFrame(
         EchoRequest(
           text: 'b',
-          count: 40,
-          payload: Uint8List(1024 * 1024),
+          count: 30,
+          payload: Uint8List(128 * 1024),
         ).writeToBuffer(),
       ),
       end: true,
     );
     await Future<void>.delayed(const Duration(seconds: 1));
-    // 40 MiB were asked. A server that does not wait for the client would
-    // have made all of them by now.
+    // 30 messages were asked. A server that does not wait for the client
+    // would have made all of them by now.
     int whileSlow = seen.produced;
-    expect(whileSlow, lessThan(20));
+    expect(whileSlow, lessThan(15));
     expect(seen.streamClosed.isCompleted, isFalse);
     // the client reads again: the rest comes
     call.resumeReading();
-    for (int i = 0; i < 20; i++) {
-      await Future<void>.delayed(const Duration(milliseconds: 500));
-      print('DBG produced=${seen.produced} received=${call.received}');
-    }
     RawResult res = await call.finish(timeout: const Duration(seconds: 20));
     await call.close();
     expect(res.status, 0);
-    expect(res.messages, hasLength(40));
-    expect(seen.produced, 40);
+    expect(res.messages, hasLength(30));
+    expect(seen.produced, 30);
   });
 
   test('client streaming', () async {
