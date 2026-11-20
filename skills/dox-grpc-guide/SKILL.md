@@ -115,7 +115,7 @@ Grpc.register(
     maxReceiveMessageSize: 4 * 1024 * 1024, // default 4 MiB
     maxSendMessageSize: 4 * 1024 * 1024, // default 4 MiB
     gzipResponses: false, // default off; gzip requests are always read
-    idleTimeout: Duration(minutes: 5), // default off
+    idleTimeout: Duration(minutes: 5), // default 5 min; null = no limit; a quiet stream gets DEADLINE_EXCEEDED
   ),
 );
 ```

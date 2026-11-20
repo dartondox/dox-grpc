@@ -216,6 +216,14 @@ class IdleEcho extends EchoService {
   String get $name => 'dox.test.IdleEcho';
 }
 
+/// a service with no idle limit
+class NoIdleEcho extends EchoService {
+  NoIdleEcho(super.seen);
+
+  @override
+  String get $name => 'dox.test.NoIdleEcho';
+}
+
 class NeedsToken implements IDoxMiddleware {
   @override
   dynamic handle(IDoxRequest req) {
@@ -264,6 +272,10 @@ void main() {
     Grpc.register(
       IdleEcho(idleSeen),
       options: const GrpcOptions(idleTimeout: Duration(milliseconds: 400)),
+    );
+    Grpc.register(
+      NoIdleEcho(Seen()),
+      options: const GrpcOptions(idleTimeout: null),
     );
     Route.middleware(<dynamic>[NeedsToken()], () {
       Grpc.register(GuardedEcho(seen));
@@ -953,6 +965,23 @@ void main() {
         isTrue,
       );
       expect(idleSeen.produced, lessThan(100));
+      call.reset();
+      await call.close();
+    });
+
+    test('the default is 5 minutes, and null turns it off', () {
+      expect(const GrpcOptions().idleTimeout, const Duration(minutes: 5));
+      expect(const GrpcOptions(idleTimeout: null).idleTimeout, isNull);
+    });
+
+    test('with idleTimeout null a quiet call is not cut', () async {
+      // IdleEcho (400 ms) cuts the same call, see the first test
+      RawCall call = await RawCall.open(port(), '/dox.test.NoIdleEcho/Unary');
+      call.send(rawFrame(EchoRequest(text: 'x').writeToBuffer()));
+      await expectLater(
+        call.finish().timeout(const Duration(milliseconds: 1500)),
+        throwsA(isA<TimeoutException>()),
+      );
       call.reset();
       await call.close();
     });
