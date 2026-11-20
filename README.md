@@ -8,6 +8,14 @@ It supports the 4 call types (unary, server streaming, client streaming, bidi), 
 
 ## Install
 
+In a Dox app, run this. It adds the package, a sample `.proto` file, a `GrpcRouter` with the health service, and `APP_HTTP2` in `.env`. It never overwrites a file, and it prints the next steps.
+
+```bash
+dox add grpc
+```
+
+Or add the package yourself:
+
 ```bash
 dart pub add dox_grpc
 ```
