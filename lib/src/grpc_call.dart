@@ -58,6 +58,10 @@ class GrpcCall implements ServiceCall {
   Map<String, String>? _trailers = <String, String>{};
 
   DateTime? _deadline;
+
+  /// A cancel this close to the deadline counts as the deadline (see
+  /// [_cancel]).
+  static const Duration _deadlineSlack = Duration(milliseconds: 50);
   Timer? _timer;
   Timer? _idleTimer;
   bool _timedOut = false;
@@ -608,7 +612,10 @@ class GrpcCall implements ServiceCall {
     _ended = true;
     _canceled = true;
     DateTime? deadline = _deadline;
-    if (deadline != null && !DateTime.now().isBefore(deadline)) {
+    // the client's timer starts when it sends the call, ours when the call
+    // comes, so its cancel at its deadline can come a bit before ours
+    if (deadline != null &&
+        !DateTime.now().add(_deadlineSlack).isBefore(deadline)) {
       _timedOut = true;
     }
     _timer?.cancel();
