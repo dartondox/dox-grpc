@@ -339,6 +339,10 @@ void main() {
     expect(seen.streamClosed.isCompleted, isFalse);
     // the client reads again: the rest comes
     call.resumeReading();
+    for (int i = 0; i < 20; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+      print('DBG produced=${seen.produced} received=${call.received}');
+    }
     RawResult res = await call.finish(timeout: const Duration(seconds: 20));
     await call.close();
     expect(res.status, 0);
