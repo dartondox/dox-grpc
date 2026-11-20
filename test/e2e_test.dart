@@ -355,6 +355,18 @@ void main() {
     ]);
   });
 
+  test('a server stream of 1 KB messages arrives whole, in order', () async {
+    List<EchoReply> replies = await echo
+        .serverStream(
+          EchoRequest(text: 'k', count: 300, payload: Uint8List(1024)),
+        )
+        .toList();
+    expect(replies.map((EchoReply r) => r.text), <String>[
+      for (int i = 0; i < 300; i++) 'k$i',
+    ]);
+    expect(replies.every((EchoReply r) => r.payload.length == 1024), isTrue);
+  });
+
   test('a stream longer than RequestTimeout is not cut', () async {
     List<EchoReply> replies = await echo
         .serverStream(EchoRequest(text: 's', count: 10, delayMs: 60))

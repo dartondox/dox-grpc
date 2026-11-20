@@ -441,7 +441,11 @@ class GrpcCall implements ServiceCall {
     _stream.add(GrpcWire.frame(bytes, compressed: _gzipResponses));
     _touch();
     if (!method.streamingResponse) return;
-    // send it now, and wait while the client is slow
+    // Room in the native window: no pause. The part goes out with the
+    // next write of the server, together with the parts made after it.
+    if (_stream.hasRoom) return;
+    // The first part (it starts the stream), or the window is full: send
+    // it now, and wait while the client is slow
     StreamSubscription<dynamic> responses = _responses!;
     responses.pause();
     _stream.flush().then(_resume, onError: _resume);
