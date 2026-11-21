@@ -1,4 +1,4 @@
-## Unreleased (3.3.0)
+## 0.0.1
 
 - `GrpcOptions.idleTimeout` is now 5 minutes by default (it was off). A call with no message in or out for 5 minutes ends with `DEADLINE_EXCEEDED`, so a quiet client can not hold a call forever. A quiet `Watch` or other long stream is closed and the client must reconnect. Pass `idleTimeout: null` for no limit.
 - Adds `dox grpc:install` (and `dox add grpc`). It adds the packages, a sample `protos/greeter.proto`, `lib/routes/grpc.dart` with the health service, and `APP_HTTP2` in `.env`, then prints the next steps. It never overwrites a file.

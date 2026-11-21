@@ -1,6 +1,6 @@
 name: dox_grpc
 description: "gRPC server for the Dox framework. Serve protoc-generated services on the native HTTP/2 server, with Dox middleware."
-version: 3.3.0
+version: 0.0.1
 repository: https://github.com/dartondox/dox-grpc
 homepage: https://dartondox.dev
 
@@ -9,8 +9,8 @@ environment:
 
 dependencies:
   dox_annotation: ^3.2.0
-  dox_core: ^3.2.3
-  dox_http_native: ^3.2.1
+  dox_core: ^3.2.4
+  dox_http_native: ^3.2.2
   grpc: ^5.2.0
   protobuf: ^6.1.0
 
