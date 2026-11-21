@@ -86,8 +86,9 @@ message HelloReply {
 import 'package:dox_core/dox_core.dart';
 import 'package:dox_grpc/dox_grpc.dart';
 
-/// Registers the gRPC services. Do not add a `prefix` or a `Route.middleware`
-/// here: gRPC clients call `/<package.Service>/<method>` exactly.
+/// Registers the gRPC services. Do not add a `prefix` here: gRPC clients call
+/// `/<package.Service>/<method>` exactly. To protect a service, register it
+/// inside `Route.middleware`, after the health service.
 class GrpcRouter extends Router {
   @override
   void register() {
