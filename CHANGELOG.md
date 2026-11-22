@@ -1,4 +1,4 @@
-## Unreleased
+## 0.0.2
 
 - The router file that `dox grpc:install` writes no longer says to keep `Route.middleware` out. A service can go inside `Route.middleware`, after the health service.
 
